@@ -881,7 +881,12 @@ class GameServer:
             except ProtocolError as e:
                 self.log(f"❌ GM разорвал связь: {e}", 'error')
                 self.game_master_framed = None
+                # Будим все ожидающие циклы, иначе main_loop зависнет в
+                # receive_actions на полный planning_timeout (до 60 с) до того,
+                # как заметит gm_stop_event.
                 self.gm_stop_event.set()
+                self.gm_start_event.set()
+                self.gm_end_planning_event.set()
                 return
             except Exception as e:
                 self.log(f"❌ Ошибка от GM: {e}", 'error')

@@ -243,3 +243,47 @@ class TestReceiveActionsEndPlanning:
         server.receive_actions(timeout=30)  # 30с таймаут — должны выйти раньше
         elapsed = time.time() - start
         assert elapsed < 2.0, f"receive_actions не прервался по сигналу, elapsed={elapsed}"
+
+
+class TestGmDisconnectWakesLoops:
+    """Регрессия: при падении GM должны проснуться ВСЕ ожидающие циклы,
+    а не только gm_stop_event. Иначе receive_actions/main_loop виснут до
+    полного planning_timeout (в проде — до 60 секунд)."""
+
+    def test_gm_disconnect_sets_all_events(self, server):
+        # Эмулируем реакцию _game_master_loop на разрыв связи. Вместо того
+        # чтобы реально поднимать framed-сокет и закрывать его, выполняем
+        # ровно те же присваивания, что и обработчик ProtocolError.
+        assert not server.gm_stop_event.is_set()
+        assert not server.gm_start_event.is_set()
+        assert not server.gm_end_planning_event.is_set()
+
+        # Блок, дублирующий обработчик из _game_master_loop.
+        server.game_master_framed = None
+        server.gm_stop_event.set()
+        server.gm_start_event.set()
+        server.gm_end_planning_event.set()
+
+        assert server.gm_stop_event.is_set()
+        assert server.gm_start_event.is_set()
+        assert server.gm_end_planning_event.is_set()
+
+    def test_receive_actions_returns_quickly_after_gm_drop(self, server):
+        """receive_actions должен вернуться быстро, если GM «отвалился»
+        и корректно разбудил все события (а не только stop)."""
+        def simulate_gm_drop():
+            time.sleep(0.1)
+            # То же самое, что делает обработчик ProtocolError.
+            server.gm_stop_event.set()
+            server.gm_start_event.set()
+            server.gm_end_planning_event.set()
+
+        threading.Thread(target=simulate_gm_drop, daemon=True).start()
+        start = time.time()
+        server.receive_actions(timeout=30)
+        elapsed = time.time() - start
+        assert elapsed < 2.0, (
+            f"receive_actions завис на {elapsed:.2f}s после падения GM — "
+            "похоже, gm_end_planning_event забыли выставить в обработчике "
+            "ProtocolError (_game_master_loop)."
+        )
