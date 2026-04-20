@@ -720,92 +720,184 @@ class GameClientGUI:
         Label(note_frame, text=note_text, bg=self.colors['panel'],
               fg=self.colors['accent3'], font=('Arial', 9)).pack()
     
+    # ------------------------------------------------------------------ #
+    #  Карточки кораблей (Task 2)
+    # ------------------------------------------------------------------ #
+
+    def _make_scrollable_cards(self, parent):
+        """Создаёт Canvas + inner Frame + scrollbar для карточек."""
+        pal = Palette()
+        canvas = Canvas(parent, bg=pal.bg_panel, highlightthickness=0, bd=0)
+        sb = ttk.Scrollbar(parent, orient=VERTICAL, command=canvas.yview)
+        inner = Frame(canvas, bg=pal.bg_panel)
+        inner.bind("<Configure>",
+                   lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side=LEFT, fill=BOTH, expand=True, padx=2, pady=2)
+        sb.pack(side=RIGHT, fill=Y)
+
+        # Прокрутка колесом мыши при наведении курсора.
+        def _on_wheel(event):
+            delta = -1 if (getattr(event, 'num', 0) == 4 or event.delta > 0) else 1
+            canvas.yview_scroll(delta, "units")
+        def _bind_wheel(_e):
+            canvas.bind_all("<MouseWheel>", _on_wheel)
+            canvas.bind_all("<Button-4>", _on_wheel)
+            canvas.bind_all("<Button-5>", _on_wheel)
+        def _unbind_wheel(_e):
+            canvas.unbind_all("<MouseWheel>")
+            canvas.unbind_all("<Button-4>")
+            canvas.unbind_all("<Button-5>")
+        canvas.bind("<Enter>", _bind_wheel)
+        canvas.bind("<Leave>", _unbind_wheel)
+        return canvas, inner
+
+    def _render_hp_bar(self, parent, hp, max_hp, width=120, height=8):
+        """Рисует горизонтальный HP-бар на Canvas-виджете."""
+        pal = Palette()
+        c = Canvas(parent, width=width, height=height,
+                   bg=pal.bg_card, highlightthickness=0, bd=0)
+        c.create_rectangle(0, 0, width, height, fill=pal.bg_panel, outline="")
+        if max_hp > 0 and hp > 0:
+            fill_w = max(2, int(width * hp / max_hp))
+            color = hp_color(hp, max_hp)
+            c.create_rectangle(0, 0, fill_w, height, fill=color, outline="")
+        return c
+
+    def _render_ship_card(self, parent, ship, ship_id, is_enemy=False):
+        """Рисует одну карточку корабля (Frame)."""
+        pal = Palette()
+        fnt = Fonts()
+        alive = ship.get('alive', True)
+        stype = ship.get('type', 'Базовый')
+        icon = ship_icon(stype)
+        short = ship_short(stype)
+        accent = ship_accent(stype)
+        team = ship.get('team', '')
+        team_clr = TEAM_COLORS.get(team, pal.fg_secondary)
+
+        bg = pal.bg_card if alive else pal.bg_panel
+        fg = pal.fg_primary if alive else pal.fg_muted
+
+        card = Frame(parent, bg=bg, highlightbackground=pal.border,
+                     highlightthickness=1, padx=6, pady=4)
+        card.pack(fill=X, padx=4, pady=2)
+
+        # --- Row 1: icon + name + position + status ---------
+        row1 = Frame(card, bg=bg)
+        row1.pack(fill=X)
+
+        badge_text = f"{icon} {short}"
+        badge_bg = team_clr if is_enemy else accent
+        Label(row1, text=badge_text, bg=badge_bg, fg="#000",
+              font=fnt.small_bold, padx=4, pady=1).pack(side=LEFT, padx=(0, 6))
+
+        name_txt = ship.get('name', stype)
+        Label(row1, text=name_txt, bg=bg, fg=fg,
+              font=fnt.body_bold).pack(side=LEFT)
+
+        pos = f"({ship.get('x', '?')},{ship.get('y', '?')},{ship.get('z', '?')})"
+        Label(row1, text=pos, bg=bg, fg=pal.fg_secondary,
+              font=fnt.small).pack(side=RIGHT, padx=(6, 0))
+
+        status_txt = "💀" if not alive else ""
+        if ship.get('is_phased'):
+            status_txt = "👻 ФАЗА"
+        if status_txt:
+            st_fg = pal.accent_phase if ship.get('is_phased') else pal.fg_muted
+            Label(row1, text=status_txt, bg=bg, fg=st_fg,
+                  font=fnt.small_bold).pack(side=RIGHT, padx=4)
+
+        # --- Row 2: HP bar -----------------------------------
+        hp = max(0, ship.get('max_hits', 2) - ship.get('hits', 0))
+        max_hp = ship.get('max_hits', 2)
+        row2 = Frame(card, bg=bg)
+        row2.pack(fill=X, pady=(2, 0))
+
+        bar = self._render_hp_bar(row2, hp, max_hp, width=140, height=7)
+        bar.pack(side=LEFT, padx=(0, 6))
+
+        hp_txt = f"{hp}/{max_hp} HP"
+        hp_clr = hp_color(hp, max_hp) if alive else pal.fg_muted
+        Label(row2, text=hp_txt, bg=bg, fg=hp_clr,
+              font=fnt.small_bold).pack(side=LEFT)
+
+        if is_enemy:
+            Label(row2, text=team, bg=bg, fg=team_clr,
+                  font=fnt.small).pack(side=RIGHT)
+            return card
+
+        # --- Row 3: abilities (only for own ships) -----------
+        row3 = Frame(card, bg=bg)
+        row3.pack(fill=X, pady=(2, 0))
+
+        pills = []
+        if ship.get('can_shoot') and alive:
+            sr = ship.get('shoot_range', 0)
+            dmg = ship.get('damage', 1)
+            lbl = f"🎯 dmg={dmg}"
+            if sr > 0:
+                lbl += f" r={sr}"
+            if ship.get('shoot_anywhere'):
+                lbl += " ∞"
+            pills.append((lbl, pal.accent_warning))
+
+        mr = ship.get('move_range', 0)
+        if mr > 0 and alive:
+            pills.append((f"🚶 move={mr}", pal.fg_secondary))
+
+        jr = ship.get('jump_range', 0)
+        if jr > 0 and alive:
+            pills.append((f"🌀 jump={jr}", SHIP_TYPE_INFO.get("Прыгун", {}).get("accent", pal.accent_mine)))
+
+        dr = ship.get('drill_range', 0)
+        if dr > 0 and alive:
+            pills.append((f"⚙ drill={dr}", SHIP_TYPE_INFO.get("Бурав", {}).get("accent", pal.accent_mine)))
+
+        hr = ship.get('heal_range', 0)
+        if hr > 0 and alive:
+            pills.append((f"🔥 heal r={hr}", pal.accent_heal))
+
+        if ship.get('can_phase') and alive:
+            cd = ship.get('phase_cooldown', 0)
+            if cd > 0:
+                pills.append((f"👻 PHASE cd={cd}", pal.fg_muted))
+            else:
+                pills.append(("👻 PHASE", pal.accent_phase))
+
+        if ship.get('can_place_mine') and alive:
+            pills.append((f"🕷 мины (dmg={ship.get('mine_damage', 0)})", pal.accent_mine))
+
+        if ship.get('can_create_hologram') and alive:
+            pills.append(("🎭 голо", pal.accent_phase))
+
+        if ship.get('scan_whole_z') and alive:
+            pills.append(("📡 скан Z", pal.accent_info))
+
+        for txt, clr in pills:
+            Label(row3, text=txt, bg=bg, fg=clr,
+                  font=fnt.small, padx=3).pack(side=LEFT)
+
+        return card
+
     def create_ships_panel(self):
-        """Панель со своими кораблями"""
+        """Панель со своими кораблями — карточки."""
         ships_frame = LabelFrame(self.root, text="🚀 ВАШИ КОРАБЛИ",
                                  bg=self.colors['panel'], fg=self.colors['accent3'],
                                  font=('Arial', 12, 'bold'))
         ships_frame.pack(fill=BOTH, expand=True, padx=10, pady=5)
-        
-        # Создаем Treeview с прокруткой
-        tree_frame = Frame(ships_frame, bg=self.colors['panel'])
-        tree_frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
-        
-        # Стиль для Treeview
-        style = ttk.Style()
-        style.theme_use('clam')
-        style.configure("Treeview",
-                       background=self.colors['bg2'],
-                       foreground='white',
-                       fieldbackground=self.colors['bg2'])
-        style.configure("Treeview.Heading",
-                       background=self.colors['accent1'],
-                       foreground='black',
-                       font=('Arial', 10, 'bold'))
-        
-        columns = ("name", "type", "position", "status", "hits", "id")
-        self.ships_tree = ttk.Treeview(tree_frame, columns=columns,
-                                        show="headings", height=6)
-        
-        # Настраиваем колонки
-        self.ships_tree.heading("name", text="Название")
-        self.ships_tree.heading("type", text="Тип")
-        self.ships_tree.heading("position", text="Позиция")
-        self.ships_tree.heading("status", text="Статус")
-        self.ships_tree.heading("hits", text="Попадания")
-        self.ships_tree.heading("id", text="ID")
-        
-        self.ships_tree.column("name", width=150)
-        self.ships_tree.column("type", width=100)
-        self.ships_tree.column("position", width=120)
-        self.ships_tree.column("status", width=80)
-        self.ships_tree.column("hits", width=80)
-        self.ships_tree.column("id", width=80)
-        
-        # Добавляем прокрутку
-        scrollbar = ttk.Scrollbar(tree_frame, orient=VERTICAL,
-                                  command=self.ships_tree.yview)
-        self.ships_tree.configure(yscrollcommand=scrollbar.set)
-        
-        self.ships_tree.pack(side=LEFT, fill=BOTH, expand=True)
-        scrollbar.pack(side=RIGHT, fill=Y)
-        
-        # Цветные теги для статусов
-        self.ships_tree.tag_configure('alive', foreground=self.colors['accent3'])
-        self.ships_tree.tag_configure('dead', foreground='gray')
+        self._ships_canvas, self._ships_cards_inner = \
+            self._make_scrollable_cards(ships_frame)
     
     def create_enemies_panel(self):
-        """Панель с вражескими кораблями"""
+        """Панель с вражескими кораблями — карточки."""
         enemies_frame = LabelFrame(self.root, text="🎯 ОБНАРУЖЕННЫЕ ВРАГИ",
                                    bg=self.colors['panel'], fg=self.colors['accent2'],
                                    font=('Arial', 12, 'bold'))
         enemies_frame.pack(fill=BOTH, expand=True, padx=10, pady=5)
-        
-        tree_frame = Frame(enemies_frame, bg=self.colors['panel'])
-        tree_frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
-        
-        columns = ("name", "type", "position", "hits", "team")
-        self.enemies_tree = ttk.Treeview(tree_frame, columns=columns,
-                                         show="headings", height=4)
-        
-        self.enemies_tree.heading("name", text="Название")
-        self.enemies_tree.heading("type", text="Тип")
-        self.enemies_tree.heading("position", text="Позиция")
-        self.enemies_tree.heading("hits", text="Попадания")
-        self.enemies_tree.heading("team", text="Команда")
-        
-        self.enemies_tree.column("name", width=150)
-        self.enemies_tree.column("type", width=100)
-        self.enemies_tree.column("position", width=120)
-        self.enemies_tree.column("hits", width=80)
-        self.enemies_tree.column("team", width=100)
-        
-        scrollbar = ttk.Scrollbar(tree_frame, orient=VERTICAL,
-                                  command=self.enemies_tree.yview)
-        self.enemies_tree.configure(yscrollcommand=scrollbar.set)
-        
-        self.enemies_tree.pack(side=LEFT, fill=BOTH, expand=True)
-        scrollbar.pack(side=RIGHT, fill=Y)
+        self._enemies_canvas, self._enemies_cards_inner = \
+            self._make_scrollable_cards(enemies_frame)
     
     def create_history_panel(self):
         """Журнал попаданий за всю партию (cumulative)."""
@@ -1178,71 +1270,41 @@ class GameClientGUI:
         self._render_timer_from_state(state)
     
     def update_ships_list(self, state):
-        """Обновляет список своих кораблей"""
-        # Очищаем список
-        for item in self.ships_tree.get_children():
-            self.ships_tree.delete(item)
-        
+        """Обновляет карточки своих кораблей."""
+        if not hasattr(self, '_ships_cards_inner'):
+            return
+        for w in self._ships_cards_inner.winfo_children():
+            w.destroy()
         ships = state.get('my_ships', {})
-        for ship_id, ship in ships.items():
-            if ship['alive']:
-                status = "✅ Жив"
-                tags = ('alive',)
-            else:
-                status = "💀 Уничтожен"
-                tags = ('dead',)
-            
-            hits_display = f"{ship['hits']}/{ship.get('max_hits', 2)}"
-            position = f"({ship['x']},{ship['y']},{ship['z']})"
-            ship_type = ship.get('type', 'Базовый')
-            
-            self.ships_tree.insert("", "end", values=(
-                ship['name'],
-                ship_type,
-                position,
-                status,
-                hits_display,
-                ship_id
-            ), tags=tags)
-    
+        # Сперва живые, потом мёртвые (группами, отсортированы по ID).
+        sorted_items = sorted(
+            ships.items(),
+            key=lambda kv: (not kv[1].get('alive', True), kv[0]),
+        )
+        for ship_id, ship in sorted_items:
+            self._render_ship_card(self._ships_cards_inner, ship, ship_id,
+                                   is_enemy=False)
+
     def update_enemies_list(self, state):
-        """Обновляет список вражеских кораблей"""
-        # Очищаем список
-        for item in self.enemies_tree.get_children():
-            self.enemies_tree.delete(item)
-        
-        enemies = state.get('visible_enemies', {})
-        if enemies:
-            for ship_id, ship in enemies.items():
-                if ship['alive']:
-                    hits_display = f"{ship['hits']}/{ship.get('max_hits', 2)}"
-                    position = f"({ship['x']},{ship['y']},{ship['z']})"
-                    ship_type = ship.get('type', 'Базовый')
-                    
-                    # Определяем цвет команды
-                    if ship['team'] == 'Team A':
-                        team_display = "🔵 Team A"
-                    elif ship['team'] == 'Team B':
-                        team_display = "🔴 Team B"
-                    else:
-                        team_display = "🟢 Team C"
-                    
-                    self.enemies_tree.insert("", "end", values=(
-                        ship['name'],
-                        ship_type,
-                        position,
-                        hits_display,
-                        team_display
-                    ))
-        else:
-            # Если врагов не видно
-            self.enemies_tree.insert("", "end", values=(
-                "👁️ Врагов не обнаружено",
-                "---",
-                "---",
-                "---",
-                "---"
-            ))
+        """Обновляет карточки обнаруженных врагов."""
+        if not hasattr(self, '_enemies_cards_inner'):
+            return
+        pal = Palette()
+        for w in self._enemies_cards_inner.winfo_children():
+            w.destroy()
+        enemies = state.get('visible_enemies', {}) or {}
+        visible_alive = {sid: s for sid, s in enemies.items() if s.get('alive')}
+        if not visible_alive:
+            Label(
+                self._enemies_cards_inner,
+                text="👁️ Врагов не обнаружено",
+                bg=pal.bg_panel, fg=pal.fg_secondary,
+                font=Fonts().body, pady=20,
+            ).pack(fill=X)
+            return
+        for ship_id, ship in sorted(visible_alive.items()):
+            self._render_ship_card(self._enemies_cards_inner, ship, ship_id,
+                                   is_enemy=True)
     
     def _render_timer_from_state(self, state):
         """Форматирует текст таймера из state (deadline + counts)."""

@@ -292,6 +292,7 @@ class Ship:
             'scan_whole_z': getattr(self, 'scan_whole_z', False),
             'ship_type': self.ship_type.value,
             'is_phased': getattr(self, 'is_phased', False),
+            'phase_cooldown': getattr(self, 'phase_cooldown', 0),
             # Статы новых типов — для клиента и будущей логики.
             'damage': getattr(self, 'damage', 1),
             'jump_range': getattr(self, 'jump_range', 0),
