@@ -1,11 +1,11 @@
 # client_player_fixed.py
 import socket
-import json
 import threading
 import time
 from tkinter import *
 from tkinter import ttk, messagebox, font
 from shared_simple import *
+from protocol import Framed, ProtocolError
 
 class MapWindow:
     def __init__(self, parent, team_name, team_color):
@@ -651,7 +651,8 @@ class GameClientGUI:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.settimeout(10)
             self.socket.connect((server_ip, 5555))
-            
+            self.framed = Framed(self.socket)
+
             # Определяем команду
             if team_choice == "1":
                 self.team = Team.TEAM_A
@@ -668,14 +669,15 @@ class GameClientGUI:
             else:
                 messagebox.showerror("Ошибка", "Неверный выбор команды")
                 return False
-            
-            # Отправляем информацию о команде
+
+            # Отправляем информацию о команде (явно указываем тип клиента).
             team_info = {
+                'type': 'player',
                 'team': self.team.value,
-                'player_name': player_name
+                'player_name': player_name,
             }
-            self.socket.send(json.dumps(team_info).encode('utf-8'))
-            
+            self.framed.send(team_info)
+
             self.connected = True
             self.team_color = team_color
             
@@ -700,29 +702,49 @@ class GameClientGUI:
             return False
     
     def receive_loop(self):
-        """Цикл получения данных от сервера"""
+        """Цикл получения данных от сервера. Использует framed-протокол,
+        каждый вызов возвращает ровно одно сообщение или None по таймауту."""
         while self.connected:
             try:
-                self.socket.settimeout(1)
-                data = self.socket.recv(65536)
-                
-                if not data:
+                msg = self.framed.recv_once(timeout=1)
+            except ProtocolError as e:
+                if self.connected:
                     self.connected = False
-                    self.root.after(0, lambda: messagebox.showinfo("Соединение", "Сервер закрыл соединение"))
-                    break
-                
-                state = json.loads(data.decode('utf-8'))
-                self.current_state = state
-                
-                # Обновляем интерфейс в основном потоке
-                self.root.after(0, self.update_interface, state)
-                
-            except socket.timeout:
-                continue
+                    self.root.after(
+                        0,
+                        lambda err=str(e): messagebox.showinfo(
+                            "Соединение", f"Сервер закрыл соединение: {err}"
+                        ),
+                    )
+                break
             except Exception as e:
                 if self.connected:
-                    print(f"Ошибка получения данных: {e}")
+                    # Не выводим в stdout — его пользователь не видит.
+                    err_text = f"Ошибка получения данных: {e}"
+                    self.root.after(
+                        0,
+                        lambda t=err_text: self.status_label.config(
+                            text=t, fg=self.colors['accent2']
+                        ),
+                    )
                     time.sleep(1)
+                continue
+
+            if msg is None:
+                continue
+
+            # Сервер может прислать reject в handshake.
+            if isinstance(msg, dict) and msg.get('type') == 'reject':
+                reason = msg.get('reason', 'Сервер отклонил подключение')
+                self.connected = False
+                self.root.after(
+                    0,
+                    lambda r=reason: messagebox.showerror("Отказ сервера", r),
+                )
+                break
+
+            self.current_state = msg
+            self.root.after(0, self.update_interface, msg)
     
     def update_interface(self, state):
         """Обновляет интерфейс на основе полученного состояния"""
@@ -1100,7 +1122,10 @@ class GameClientGUI:
             if action_type == "none":
                 # Удаляем существующее действие
                 self.actions = [a for a in self.actions if a.ship_id != ship_id]
-                messagebox.showinfo("Информация", f"⏭️ Действие для {ship_name} удалено")
+                self.status_label.config(
+                    text=f"⏭️ Действие для {ship_name} удалено",
+                    fg=self.colors['accent4'],
+                )
                 return
             
             if action_type == "move":
@@ -1208,7 +1233,10 @@ class GameClientGUI:
             self.actions = [a for a in self.actions if a.ship_id != ship_id]
             self.actions.append(action)
             
-            messagebox.showinfo("Сохранено", f"✅ Действие для {ship_name} сохранено")
+            self.status_label.config(
+                text=f"✅ Действие для {ship_name} сохранено",
+                fg=self.colors['accent3'],
+            )
             
         except ValueError as e:
             messagebox.showerror("Ошибка", f"Неверный формат координат: {e}")
@@ -1223,11 +1251,14 @@ class GameClientGUI:
         
         try:
             actions_data = [a.to_dict() for a in self.actions]
-            self.socket.send(json.dumps(actions_data).encode('utf-8'))
-            
-            messagebox.showinfo("Успех", f"🚀 Отправлено {len(self.actions)} действий")
+            self.framed.send(actions_data)
+
+            self.status_label.config(
+                text=f"🚀 Отправлено действий: {len(self.actions)}",
+                fg=self.colors['accent3'],
+            )
             self.actions = []
-            
+
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось отправить действия: {e}")
     

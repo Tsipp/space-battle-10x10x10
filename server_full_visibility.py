@@ -1,11 +1,20 @@
 # server_full_visibility.py
 import socket
 import threading
-import json
 import time
-import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox, font
 from shared_simple import *
+from protocol import Framed, ProtocolError
+
+# Tkinter импортируется опционально: игровая логика (GameServer) работает без него,
+# GUI-класс GameServerGUI просто не будет доступен в окружениях без Tk.
+try:
+    import tkinter as tk
+    from tkinter import ttk, scrolledtext, messagebox, font
+    _HAS_TK = True
+except Exception:  # pragma: no cover - в окружении с Tk эта ветка не срабатывает
+    tk = None
+    ttk = scrolledtext = messagebox = font = None
+    _HAS_TK = False
 
 class GameServerGUI:
     def __init__(self):
@@ -27,8 +36,9 @@ class GameServerGUI:
             'game_mode': 'advanced'
         }
         self.actions_received = {}
+        # (GUI-поле, оставляем для совместимости отображения)
         self.game_master_socket = None
-        
+
         # Создаём главное окно
         self.root = tk.Tk()
         self.root.title("🚀 КОСМИЧЕСКИЙ БОЙ - СЕРВЕР")
@@ -412,8 +422,12 @@ class GameServerGUI:
         """Обновляет статистику в интерфейсе"""
         if not hasattr(self, 'game_server') or not self.game_server:
             return
-        
-        ships = self.game_server.game_state['ships']
+
+        # Снимаем копию списка под блокировкой — сам доступ к атрибутам
+        # корабля безопасен, но `ships` может быть перезаписан в create_ships
+        # или модифицирован в process_turn из сетевого потока.
+        with self.game_server.state_lock:
+            ships = dict(self.game_server.game_state['ships'])
         
         # Обновляем статистику команд
         team_stats = {
@@ -478,8 +492,9 @@ class GameServerGUI:
         players = len(self.game_server.clients)
         self.players_label.config(text=f"{players}/3")
         
-        gm_status = "✅" if self.game_server.game_master_socket else "❌"
-        gm_color = self.colors['accent3'] if self.game_server.game_master_socket else 'red'
+        gm_connected = self.game_server.game_master_framed is not None
+        gm_status = "✅" if gm_connected else "❌"
+        gm_color = self.colors['accent3'] if gm_connected else 'red'
         self.gm_label.config(text=gm_status, fg=gm_color)
     
     def start_server(self):
@@ -544,7 +559,8 @@ class GameServer:
         self.game_mode = game_mode
         self.gui = gui  # Ссылка на GUI для логирования
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.clients = {}  # team -> socket
+        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.clients = {}  # team -> Framed
         self.client_threads = {}  # team -> thread
         self.game_state = {
             'turn': 0,
@@ -557,11 +573,15 @@ class GameServer:
         }
         self.actions_received = {}
         self.running = True
-        
+
+        # Защита общего состояния — методы обработки хода изменяют `ships`,
+        # а GUI-поток одновременно читает их при построении статистики.
+        self.state_lock = threading.RLock()
+
         # Для гейммастера
-        self.game_master_socket = None
+        self.game_master_framed = None
         self.game_master_thread = None
-        
+
         # Создаем корабли
         self.create_ships()
     
@@ -710,72 +730,97 @@ class GameServer:
                     self.log(f"❌ Ошибка при принятии подключения: {e}", 'error')
     
     def handle_client(self, client_socket, address):
+        framed = Framed(client_socket)
         try:
-            data = client_socket.recv(1024).decode('utf-8')
-            if not data:
+            # Первое сообщение — handshake от клиента.
+            # Ограничиваем время ожидания, иначе зависший коннект удерживает поток.
+            info = framed.recv_once(timeout=10)
+            if info is None:
+                self.log(f"⌛ Клиент {address} не прислал приветствие за 10с", 'warning')
+                framed.close()
                 return
-            
-            info = json.loads(data)
+
             client_type = info.get('type', 'player')
-            
+
             if client_type == 'game_master':
-                # Подключение гейммастера
-                self.game_master_socket = client_socket
+                if self.game_master_framed is not None:
+                    self.log(f"⚠️ Гейммастер уже подключён — отказ {address}", 'warning')
+                    try:
+                        framed.send({'type': 'reject', 'reason': 'Гейммастер уже подключён'})
+                    except Exception:
+                        pass
+                    framed.close()
+                    return
+                self.game_master_framed = framed
                 self.game_master_thread = threading.current_thread()
                 self.log(f"🎮 Подключился ГЕЙММАСТЕР", 'success')
-                
+
                 # Отправляем полную карту гейммастеру
                 self.send_full_state_to_game_master()
-                
+
+                # Держим поток живым, пока идёт игра; без busy-wait не обойтись,
+                # потому что обработка ходов ведётся из main_loop сервера.
                 while self.running and not self.game_state['game_over']:
                     time.sleep(0.5)
-                    
-            else:
-                # Подключение игрока
-                team_name = info.get('team')
-                player_name = info.get('player_name', 'Неизвестный')
-                
-                if team_name == "Team A":
-                    team = Team.TEAM_A
-                elif team_name == "Team B":
-                    team = Team.TEAM_B
-                elif team_name == "Team C":
-                    team = Team.TEAM_C
-                else:
-                    self.log(f"❌ Неизвестная команда: {team_name}", 'error')
-                    client_socket.close()
-                    return
-                
-                if team in self.clients:
-                    self.log(f"⚠️ Команда {team.value} уже подключена", 'warning')
-                    client_socket.close()
-                    return
-                
-                self.clients[team] = client_socket
-                self.client_threads[team] = threading.current_thread()
-                self.log(f"✅ Подключился {player_name} как {team.value}", 'success')
-                self.log(f"   Всего игроков: {len(self.clients)}/3", 'info')
-                
-                # Отправляем начальное состояние игроку
-                self.send_state_to_team(team)
-                
-                while self.running and not self.game_state['game_over']:
-                    time.sleep(0.5)
-                
+                return
+
+            # Подключение игрока
+            team_name = info.get('team')
+            player_name = info.get('player_name', 'Неизвестный')
+
+            team_map = {
+                "Team A": Team.TEAM_A,
+                "Team B": Team.TEAM_B,
+                "Team C": Team.TEAM_C,
+            }
+            team = team_map.get(team_name)
+            if team is None:
+                self.log(f"❌ Неизвестная команда: {team_name!r}", 'error')
+                try:
+                    framed.send({'type': 'reject', 'reason': f'Неизвестная команда: {team_name}'})
+                except Exception:
+                    pass
+                framed.close()
+                return
+
+            if team in self.clients:
+                self.log(f"⚠️ Команда {team.value} уже подключена", 'warning')
+                try:
+                    framed.send({'type': 'reject', 'reason': f'Команда {team.value} уже занята'})
+                except Exception:
+                    pass
+                framed.close()
+                return
+
+            self.clients[team] = framed
+            self.client_threads[team] = threading.current_thread()
+            self.log(f"✅ Подключился {player_name} как {team.value}", 'success')
+            self.log(f"   Всего игроков: {len(self.clients)}/3", 'info')
+
+            # Отправляем начальное состояние игроку
+            self.send_state_to_team(team)
+
+            while self.running and not self.game_state['game_over']:
+                time.sleep(0.5)
+
+        except ProtocolError as e:
+            self.log(f"❌ Протокольная ошибка от {address}: {e}", 'error')
         except Exception as e:
             self.log(f"❌ Ошибка в обработке клиента {address}: {e}", 'error')
     
     def send_state_to_team(self, team):
-        """Отправляет состояние команде"""
-        if team in self.clients:
-            try:
+        """Отправляет состояние команде через framed-протокол."""
+        framed = self.clients.get(team)
+        if framed is None:
+            return
+        try:
+            with self.state_lock:
                 my_ships = {}
-                visible_enemies = self.get_visible_enemies(team)
-                
                 for ship_id, ship in self.game_state['ships'].items():
                     if ship.team == team:
                         my_ships[ship_id] = ship.to_dict()
-                
+                visible_enemies = self.get_visible_enemies(team)
+
                 state = {
                     'turn': self.game_state['turn'],
                     'my_ships': my_ships,
@@ -785,25 +830,28 @@ class GameServer:
                     'message': 'Планируйте ход' if self.game_state['phase'] == 'planning' else 'Результаты хода',
                     'game_over': self.game_state['game_over'],
                     'winner': self.game_state['winner'],
-                    'game_mode': self.game_state['game_mode']
+                    'game_mode': self.game_state['game_mode'],
+                    'last_hits': self.game_state['last_hits'],
                 }
-                
-                self.clients[team].send(json.dumps(state).encode('utf-8'))
-                
-            except Exception as e:
-                self.log(f"❌ Ошибка отправки состояния команде {team.value}: {e}", 'error')
-                try:
-                    del self.clients[team]
-                    del self.client_threads[team]
-                except:
-                    pass
-    
+            framed.send(state)
+        except Exception as e:
+            self.log(f"❌ Ошибка отправки состояния команде {team.value}: {e}", 'error')
+            self._drop_client(team)
+
+    def _drop_client(self, team):
+        """Безопасно удаляет клиента из словарей."""
+        framed = self.clients.pop(team, None)
+        self.client_threads.pop(team, None)
+        if framed is not None:
+            framed.close()
+
     def send_full_state_to_game_master(self):
-        """Отправляет полное состояние гейммастеру"""
-        if self.game_master_socket:
-            try:
+        """Отправляет полное состояние гейммастеру."""
+        if self.game_master_framed is None:
+            return
+        try:
+            with self.state_lock:
                 all_ships = self.get_full_map_for_game_master()
-                
                 state = {
                     'type': 'game_master',
                     'turn': self.game_state['turn'],
@@ -813,216 +861,176 @@ class GameServer:
                     'winner': self.game_state['winner'],
                     'last_hits': self.game_state['last_hits'],
                     'message': f'Ход {self.game_state["turn"] + 1} - {self.game_state["phase"]}',
-                    'game_mode': self.game_state['game_mode']
+                    'game_mode': self.game_state['game_mode'],
                 }
-                
-                self.game_master_socket.send(json.dumps(state).encode('utf-8'))
-                self.log(f"📊 Отправлена полная карта гейммастеру", 'info')
-                
-            except Exception as e:
-                self.log(f"❌ Ошибка отправки состояния гейммастеру: {e}", 'error')
-    
+            self.game_master_framed.send(state)
+            self.log(f"📊 Отправлена полная карта гейммастеру", 'info')
+        except Exception as e:
+            self.log(f"❌ Ошибка отправки состояния гейммастеру: {e}", 'error')
+            try:
+                self.game_master_framed.close()
+            except Exception:
+                pass
+            self.game_master_framed = None
+
     def send_state_to_all(self):
         """Отправляет состояние всем подключенным"""
         for team in list(self.clients.keys()):
             self.send_state_to_team(team)
-        
-        if self.game_master_socket:
-            self.send_full_state_to_game_master()
+        self.send_full_state_to_game_master()
     
     def receive_actions(self, timeout=60):
         self.log(f"\n{'='*60}", 'system')
         self.log(f"⏳ СБОР ДЕЙСТВИЙ (таймаут: {timeout} сек)", 'system')
         self.log(f"{'='*60}", 'system')
-        
+
         self.actions_received.clear()
         start_time = time.time()
-        
+        dropped = []
+
         while time.time() - start_time < timeout and self.running:
-            for team, client in list(self.clients.items()):
-                if team not in self.actions_received:
-                    try:
-                        client.settimeout(0.5)
-                        data = client.recv(65536)
-                        if data:
-                            actions_data = json.loads(data.decode('utf-8'))
-                            actions = []
-                            for action_dict in actions_data:
-                                action = Action(
-                                    ship_id=action_dict['ship_id'],
-                                    action_type=ActionType(action_dict['action_type']),
-                                    target_x=action_dict.get('target_x'),
-                                    target_y=action_dict.get('target_y'),
-                                    target_z=action_dict.get('target_z')
-                                )
-                                actions.append(action)
-                            
-                            self.actions_received[team] = actions
-                            self.log(f"✅ Получено {len(actions)} действий от {team.value}", 'success')
-                    except socket.timeout:
-                        continue
-                    except Exception as e:
-                        self.log(f"❌ Ошибка от {team.value}: {e}", 'error')
-            
+            for team, framed in list(self.clients.items()):
+                if team in self.actions_received:
+                    continue
+                try:
+                    msg = framed.recv_once(timeout=0.2)
+                except ProtocolError as e:
+                    self.log(f"❌ Разрыв связи с {team.value}: {e}", 'error')
+                    dropped.append(team)
+                    continue
+                except Exception as e:
+                    self.log(f"❌ Ошибка от {team.value}: {e}", 'error')
+                    continue
+                if msg is None:
+                    continue
+                try:
+                    actions = [Action.from_dict(d) for d in msg]
+                except (KeyError, ValueError, TypeError) as e:
+                    self.log(f"❌ Некорректные действия от {team.value}: {e}", 'error')
+                    continue
+                self.actions_received[team] = actions
+                self.log(f"✅ Получено {len(actions)} действий от {team.value}", 'success')
+
+            for team in dropped:
+                self._drop_client(team)
+            dropped.clear()
+
             connected_teams = list(self.clients.keys())
             if connected_teams and all(team in self.actions_received for team in connected_teams):
                 self.log(f"\n✅ Все команды отправили действия!", 'success')
                 return True
-            
-            time.sleep(0.1)
-        
+
+            time.sleep(0.05)
+
         self.log(f"\n⏰ Время вышло!", 'warning')
-        
-        for team in self.clients.keys():
+
+        for team in list(self.clients.keys()):
             if team not in self.actions_received:
                 self.actions_received[team] = []
                 self.log(f"⚠️ {team.value} не ответила", 'warning')
-        
+
         return True
     
     def process_turn(self):
+        """Обрабатывает ход: сначала все перемещения (с проверкой коллизий
+        клеток), затем симультанный залп — все попадания фиксируются от
+        ПРЕДШЕСТВУЮЩИХ позиций, и только потом применяется урон. Это убирает
+        эффект «кто первый отправил ход — тот первый стреляет»."""
+        with self.state_lock:
+            return self._process_turn_locked()
+
+    def _process_turn_locked(self):
         self.log(f"\n{'='*60}", 'system')
         self.log(f"🔄 ОБРАБОТКА ХОДА {self.game_state['turn'] + 1}", 'system')
         self.log(f"{'='*60}", 'system')
-        
+
         ships = self.game_state['ships']
         self.game_state['last_hits'] = []
-        
-        # Обработка перемещений
+
+        # ==== ФАЗА 1: ПЕРЕМЕЩЕНИЯ ====
         self.log("\n📦 ПЕРЕМЕЩЕНИЯ:", 'info')
         for team, actions in self.actions_received.items():
             for action in actions:
-                if action.action_type == ActionType.MOVE:
-                    ship = ships.get(action.ship_id)
-                    if ship and ship.alive and ship.team == team:
-                        if ship.move_range > 0:
-                            old_pos = f"({ship.x},{ship.y},{ship.z})"
-                            if ship.move(action.target_x, action.target_y, action.target_z):
-                                new_pos = f"({ship.x},{ship.y},{ship.z})"
-                                self.log(f"   {ship.name}: {old_pos} → {new_pos}", 'info')
-                            else:
-                                self.log(f"   ⚠️ {ship.name}: недопустимое перемещение", 'warning')
-                        else:
-                            self.log(f"   ⚠️ {ship.name}: не может двигаться", 'warning')
-        
-        # Обработка выстрелов
+                if action.action_type != ActionType.MOVE:
+                    continue
+                ship = ships.get(action.ship_id)
+                if not ship or not ship.alive or ship.team != team:
+                    continue
+                if ship.move_range <= 0:
+                    self.log(f"   ⚠️ {ship.name}: не может двигаться", 'warning')
+                    continue
+
+                # Коллизия: целевая клетка не должна быть занята другим
+                # живым кораблём (ни своим, ни чужим). Порядок обработки
+                # зависит от порядка actions_received — это задокументировано
+                # поведение: если двое целятся в одну клетку, попадёт тот,
+                # чьё действие обработано раньше.
+                tx, ty, tz = action.target_x, action.target_y, action.target_z
+                occupied = any(
+                    other.alive and other.id != ship.id
+                    and other.x == tx and other.y == ty and other.z == tz
+                    for other in ships.values()
+                )
+                if occupied:
+                    self.log(f"   ⚠️ {ship.name}: клетка ({tx},{ty},{tz}) занята", 'warning')
+                    continue
+
+                old_pos = (ship.x, ship.y, ship.z)
+                if ship.move(tx, ty, tz):
+                    self.log(f"   {ship.name}: {old_pos} → ({ship.x},{ship.y},{ship.z})", 'info')
+                else:
+                    self.log(f"   ⚠️ {ship.name}: недопустимое перемещение", 'warning')
+
+        # ==== ФАЗА 2: ВЫСТРЕЛЫ (симультанно) ====
+        # Сначала для каждого выстрела определяем, в кого он попадает (если
+        # вообще попадает). Урон применяем только после обработки всех выстрелов.
         self.log("\n🎯 ВЫСТРЕЛЫ:", 'info')
-        hits = []
+        hit_records = []  # список (attacker_ship, target_ship, position_tuple)
         missiles_fired = 0
-        
+
         for team, actions in self.actions_received.items():
             for action in actions:
-                if action.action_type == ActionType.SHOOT:
-                    ship = ships.get(action.ship_id)
-                    if ship and ship.alive and ship.team == team:
-                        if not ship.can_shoot:
-                            self.log(f"   ⚠️ {ship.name} не может стрелять", 'warning')
-                            continue
-                        
-                        if not ship.can_shoot_at(action.target_x, action.target_y, action.target_z):
-                            self.log(f"   ⚠️ {ship.name}: недопустимая цель", 'warning')
-                            continue
-                        
-                        missiles_fired += 1
-                        
-                        # Для артиллерии - прямая стрельба
-                        if ship.ship_type == ShipType.ARTILLERY:
-                            for target_ship in ships.values():
-                                if (target_ship.alive and 
-                                    target_ship.team != team and
-                                    target_ship.x == action.target_x and
-                                    target_ship.y == action.target_y and
-                                    target_ship.z == action.target_z):
-                                    
-                                    target_ship.take_hit()
-                                    hit_info = {
-                                        'attacker': ship.team.value,
-                                        'attacker_name': ship.name,
-                                        'target': target_ship.team.value,
-                                        'target_name': target_ship.name,
-                                        'position': f"({action.target_x},{action.target_y},{action.target_z})"
-                                    }
-                                    self.game_state['last_hits'].append(hit_info)
-                                    hits.append(f"{ship.name} ({ship.team.value}) → {target_ship.name} ({target_ship.team.value})")
-                                    self.log(f"   ✅ {ship.name} поразил {target_ship.name}!", 'success')
-                                    break
-                        
-                        else:
-                            # Обычная стрельба по прямой
-                            if action.target_x != ship.x:
-                                step = 1 if action.target_x > ship.x else -1
-                                distance = min(5, abs(action.target_x - ship.x))
-                                for i in range(1, distance + 1):
-                                    x = ship.x + i * step
-                                    for target_ship in ships.values():
-                                        if (target_ship.alive and 
-                                            target_ship.team != team and
-                                            target_ship.x == x and 
-                                            target_ship.y == ship.y and 
-                                            target_ship.z == ship.z):
-                                            target_ship.take_hit()
-                                            hit_info = {
-                                                'attacker': ship.team.value,
-                                                'attacker_name': ship.name,
-                                                'target': target_ship.team.value,
-                                                'target_name': target_ship.name,
-                                                'position': f"({x},{ship.y},{ship.z})"
-                                            }
-                                            self.game_state['last_hits'].append(hit_info)
-                                            hits.append(f"{ship.name} ({ship.team.value}) → {target_ship.name} ({target_ship.team.value})")
-                                            self.log(f"   ✅ {ship.name} поразил {target_ship.name}!", 'success')
-                                            break
-                            
-                            elif action.target_y != ship.y:
-                                step = 1 if action.target_y > ship.y else -1
-                                distance = min(5, abs(action.target_y - ship.y))
-                                for i in range(1, distance + 1):
-                                    y = ship.y + i * step
-                                    for target_ship in ships.values():
-                                        if (target_ship.alive and 
-                                            target_ship.team != team and
-                                            target_ship.x == ship.x and 
-                                            target_ship.y == y and 
-                                            target_ship.z == ship.z):
-                                            target_ship.take_hit()
-                                            hit_info = {
-                                                'attacker': ship.team.value,
-                                                'attacker_name': ship.name,
-                                                'target': target_ship.team.value,
-                                                'target_name': target_ship.name,
-                                                'position': f"({ship.x},{y},{ship.z})"
-                                            }
-                                            self.game_state['last_hits'].append(hit_info)
-                                            hits.append(f"{ship.name} ({ship.team.value}) → {target_ship.name} ({target_ship.team.value})")
-                                            self.log(f"   ✅ {ship.name} поразил {target_ship.name}!", 'success')
-                                            break
-                            
-                            elif action.target_z != ship.z:
-                                step = 1 if action.target_z > ship.z else -1
-                                distance = min(5, abs(action.target_z - ship.z))
-                                for i in range(1, distance + 1):
-                                    z = ship.z + i * step
-                                    for target_ship in ships.values():
-                                        if (target_ship.alive and 
-                                            target_ship.team != team and
-                                            target_ship.x == ship.x and 
-                                            target_ship.y == ship.y and 
-                                            target_ship.z == z):
-                                            target_ship.take_hit()
-                                            hit_info = {
-                                                'attacker': ship.team.value,
-                                                'attacker_name': ship.name,
-                                                'target': target_ship.team.value,
-                                                'target_name': target_ship.name,
-                                                'position': f"({ship.x},{ship.y},{z})"
-                                            }
-                                            self.game_state['last_hits'].append(hit_info)
-                                            hits.append(f"{ship.name} ({ship.team.value}) → {target_ship.name} ({target_ship.team.value})")
-                                            self.log(f"   ✅ {ship.name} поразил {target_ship.name}!", 'success')
-                                            break
-        
+                if action.action_type != ActionType.SHOOT:
+                    continue
+                ship = ships.get(action.ship_id)
+                if not ship or not ship.alive or ship.team != team:
+                    continue
+                if not ship.can_shoot:
+                    self.log(f"   ⚠️ {ship.name} не может стрелять", 'warning')
+                    continue
+                if not ship.can_shoot_at(action.target_x, action.target_y, action.target_z):
+                    self.log(f"   ⚠️ {ship.name}: недопустимая цель", 'warning')
+                    continue
+
+                missiles_fired += 1
+                target_ship, position = self._resolve_shot(ship, action)
+                if target_ship is not None:
+                    hit_records.append((ship, target_ship, position))
+
+        # Применяем урон одним залпом — корабль мог погибнуть, но он всё равно
+        # должен был успеть выстрелить в этот же ход.
+        for attacker, target, pos in hit_records:
+            if not target.alive:
+                # Несколько попаданий в уже мёртвый корабль — всё равно лог.
+                self.log(f"   💀 {attacker.name} добивает {target.name}", 'info')
+            target.take_hit()
+            hit_info = {
+                'attacker': attacker.team.value,
+                'attacker_name': attacker.name,
+                'target': target.team.value,
+                'target_name': target.name,
+                'position': f"({pos[0]},{pos[1]},{pos[2]})",
+            }
+            self.game_state['last_hits'].append(hit_info)
+            self.log(f"   ✅ {attacker.name} поразил {target.name}!", 'success')
+
+        hits = [
+            f"{a.name} ({a.team.value}) → {t.name} ({t.team.value})"
+            for (a, t, _) in hit_records
+        ]
+
         self.log(f"   Выпущено ракет: {missiles_fired}", 'info')
-        
+
         # Результаты
         self.log(f"\n📊 РЕЗУЛЬТАТЫ ХОДА {self.game_state['turn'] + 1}:", 'system')
         
@@ -1056,10 +1064,75 @@ class GameServer:
         
         self.game_state['turn'] += 1
         return True
-    
+
+    def _resolve_shot(self, attacker, action):
+        """Определяет, в кого попадает выстрел.
+
+        Возвращает (target_ship, (x,y,z)) или (None, None).
+
+        - Артиллерия: точечный удар в клетку (attacker уже прошёл can_shoot_at).
+          Поражает любой живой корабль команды-противника в этой клетке.
+        - Обычный выстрел: пуля летит по прямой по одной оси. Блокируется
+          ПЕРВЫМ живым кораблём на линии (своим или чужим). Засчитывается
+          попадание, только если этот корабль — из команды противника.
+        """
+        ships = self.game_state['ships']
+        tx, ty, tz = action.target_x, action.target_y, action.target_z
+
+        if attacker.ship_type == ShipType.ARTILLERY:
+            for target in ships.values():
+                if (target.alive and target.team != attacker.team
+                        and target.x == tx and target.y == ty and target.z == tz):
+                    return target, (tx, ty, tz)
+            return None, None
+
+        # Определяем ось и шаг
+        if tx != attacker.x:
+            axis = 'x'
+            step = 1 if tx > attacker.x else -1
+            distance = min(attacker.shoot_range, abs(tx - attacker.x))
+        elif ty != attacker.y:
+            axis = 'y'
+            step = 1 if ty > attacker.y else -1
+            distance = min(attacker.shoot_range, abs(ty - attacker.y))
+        elif tz != attacker.z:
+            axis = 'z'
+            step = 1 if tz > attacker.z else -1
+            distance = min(attacker.shoot_range, abs(tz - attacker.z))
+        else:
+            return None, None
+
+        for i in range(1, distance + 1):
+            if axis == 'x':
+                cell = (attacker.x + i * step, attacker.y, attacker.z)
+            elif axis == 'y':
+                cell = (attacker.x, attacker.y + i * step, attacker.z)
+            else:
+                cell = (attacker.x, attacker.y, attacker.z + i * step)
+
+            blocker = next(
+                (s for s in ships.values()
+                 if s.alive and s.id != attacker.id
+                 and (s.x, s.y, s.z) == cell),
+                None,
+            )
+            if blocker is None:
+                continue
+            # Первый корабль на линии огня блокирует выстрел.
+            if blocker.team != attacker.team:
+                return blocker, cell
+            # Союзник загородил цель — выстрел гасится, попадания нет.
+            self.log(
+                f"   🛡️ Выстрел {attacker.name} заблокирован союзником {blocker.name} в {cell}",
+                'warning',
+            )
+            return None, None
+
+        return None, None
+
     def main_loop(self):
         self.log("\n⏳ ОЖИДАНИЕ ПОДКЛЮЧЕНИЙ...", 'system')
-        while (len(self.clients) < 3 or not self.game_master_socket) and self.running:
+        while (len(self.clients) < 3 or self.game_master_framed is None) and self.running:
             time.sleep(1)
         
         if not self.running:
@@ -1106,19 +1179,20 @@ class GameServer:
     
     def stop(self):
         self.running = False
-        for client in self.clients.values():
+        for framed in list(self.clients.values()):
             try:
-                client.close()
-            except:
+                framed.close()
+            except Exception:
                 pass
-        if self.game_master_socket:
+        if self.game_master_framed is not None:
             try:
-                self.game_master_socket.close()
-            except:
+                self.game_master_framed.close()
+            except Exception:
                 pass
+            self.game_master_framed = None
         try:
             self.server.close()
-        except:
+        except Exception:
             pass
         self.log("\n🛑 Сервер остановлен", 'warning')
 

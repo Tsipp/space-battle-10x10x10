@@ -1,11 +1,11 @@
 # game_master_gui.py
 import socket
-import json
 import threading
 import time
 from tkinter import *
 from tkinter import ttk, messagebox, font
 from shared_simple import *
+from protocol import Framed, ProtocolError
 
 class GameMasterGUI:
     def __init__(self):
@@ -366,14 +366,15 @@ class GameMasterGUI:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.settimeout(10)
             self.socket.connect((server_ip, 5555))
-            
+            self.framed = Framed(self.socket)
+
             # Отправляем информацию о гейммастере
             game_master_info = {
                 'type': 'game_master',
-                'player_name': player_name
+                'player_name': player_name,
             }
-            self.socket.send(json.dumps(game_master_info).encode('utf-8'))
-            
+            self.framed.send(game_master_info)
+
             self.connected = True
             self.status_label.config(text="✅ Подключен к серверу", fg=self.colors['accent3'])
             
@@ -390,28 +391,46 @@ class GameMasterGUI:
             messagebox.showerror("Ошибка подключения", f"Не удалось подключиться: {e}")
     
     def receive_loop(self):
-        """Цикл получения данных от сервера"""
+        """Цикл получения данных от сервера через framed-протокол."""
         while self.connected:
             try:
-                self.socket.settimeout(1)
-                data = self.socket.recv(65536)
-                
-                if not data:
+                msg = self.framed.recv_once(timeout=1)
+            except ProtocolError as e:
+                if self.connected:
                     self.connected = False
-                    self.root.after(0, lambda: messagebox.showinfo("Соединение", "Сервер закрыл соединение"))
-                    break
-                
-                state = json.loads(data.decode('utf-8'))
-                self.current_state = state
-                
-                # Обновляем интерфейс в основном потоке
-                self.root.after(0, self.update_interface, state)
-                
-            except socket.timeout:
-                continue
+                    self.root.after(
+                        0,
+                        lambda err=str(e): messagebox.showinfo(
+                            "Соединение", f"Сервер закрыл соединение: {err}"
+                        ),
+                    )
+                break
             except Exception as e:
                 if self.connected:
-                    print(f"Ошибка получения данных: {e}")
+                    err_text = f"Ошибка получения данных: {e}"
+                    self.root.after(
+                        0,
+                        lambda t=err_text: self.message_label.config(
+                            text=t, fg='red'
+                        ),
+                    )
+                    time.sleep(1)
+                continue
+
+            if msg is None:
+                continue
+
+            if isinstance(msg, dict) and msg.get('type') == 'reject':
+                reason = msg.get('reason', 'Сервер отклонил подключение')
+                self.connected = False
+                self.root.after(
+                    0,
+                    lambda r=reason: messagebox.showerror("Отказ сервера", r),
+                )
+                break
+
+            self.current_state = msg
+            self.root.after(0, self.update_interface, msg)
     
     def update_interface(self, state):
         """Обновляет интерфейс на основе полученного состояния"""
