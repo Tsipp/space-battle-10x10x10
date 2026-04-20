@@ -127,15 +127,20 @@ class TeamBot:
     # --- shoot helpers -------------------------------------------------------
 
     def _pick_shoot_target(self, ship, enemies):
-        """Ищет врага, по которому данный корабль реально может выстрелить."""
+        """Ищет врага, по которому данный корабль реально может выстрелить.
+
+        При равной дистанции выбор рандомизирован rng, чтобы партии
+        с разными сидами ветвились по-разному.
+        """
         if not ship.can_shoot or not enemies:
             return None
 
-        # Сортируем врагов по расстоянию от нашего корабля (Чебышёв-радиус).
         def _dist(e):
             return max(abs(e.x - ship.x), abs(e.y - ship.y), abs(e.z - ship.z))
 
-        ordered = sorted(enemies, key=_dist)
+        shuffled = list(enemies)
+        self.rng.shuffle(shuffled)
+        ordered = sorted(shuffled, key=_dist)
         for enemy in ordered:
             if ship.can_shoot_at(enemy.x, enemy.y, enemy.z):
                 return enemy
@@ -156,12 +161,14 @@ class TeamBot:
         # Попробуем «жадный» вариант + несколько запасных, чтобы обойти
         # случай «клетка прямо впереди занята союзником».
         dx0, dy0, dz0 = _sgn(sx, tx), _sgn(sy, ty), _sgn(sz, tz)
-        candidates = [(dx0, dy0, dz0)]
-        # Запасные варианты: один из компонентов обнулим.
-        candidates += [
+        fallback = [
             (dx0, dy0, 0), (dx0, 0, dz0), (0, dy0, dz0),
             (dx0, 0, 0), (0, dy0, 0), (0, 0, dz0),
         ]
+        # Подмешиваем рандомизацию: если есть несколько равнозначных
+        # шагов — сид rng выбирает, куда пойдём, чтобы разные партии ветвились.
+        self.rng.shuffle(fallback)
+        candidates = [(dx0, dy0, dz0), *fallback]
         for (dx, dy, dz) in candidates:
             if dx == 0 and dy == 0 and dz == 0:
                 continue
@@ -405,7 +412,9 @@ def simulate(
 
     # --- дамп ----------------------------------------------------------------
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%SZ")
-    out_path = os.path.join(ROOT, "game_logs", f"game_{ts}.log")
+    out_path = os.path.join(
+        ROOT, "game_logs", f"game_{ts}_{game_mode}_seed{seed}.log"
+    )
     transcript.dump(out_path)
 
     # Закрыть сокет, чтобы не оставался открытый файловый дескриптор.
@@ -418,5 +427,20 @@ def simulate(
 
 
 if __name__ == "__main__":
-    path = simulate()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Headless Space Battle simulation")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="RNG seed (для детерминированности)")
+    parser.add_argument("--max-turns", type=int, default=30,
+                        help="Максимум ходов до объявления ничьей")
+    parser.add_argument("--mode", choices=("advanced", "basic"), default="advanced",
+                        help="Режим игры: advanced (разные типы) или basic (только крейсеры)")
+    args = parser.parse_args()
+
+    path = simulate(
+        max_turns=args.max_turns,
+        seed=args.seed,
+        game_mode=args.mode,
+    )
     print(f"Simulation complete. Log written to:\n  {path}")
