@@ -59,7 +59,9 @@ class TestNewShipTypes:
     def test_jumper(self):
         s = make(ship_type=ShipType.JUMPER)
         assert s.max_hits == 2
-        assert s.move_range == 4
+        # Баланс v7 / Devin Review #4: move_range синхронизирован с
+        # jump_range (оба = 2), чтобы не было мёртвого кода.
+        assert s.move_range == 2
         assert s.jump_range == 2
         assert s.damage == 1
         assert s.can_shoot is True

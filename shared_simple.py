@@ -107,15 +107,16 @@ class Ship:
             self.damage = 0
 
         elif ship_type == ShipType.JUMPER:
-            # Прыгун: hp=2, прыжок на 3 клетки сквозь корабли,
+            # Прыгун: hp=2, прыжок на 2 клетки сквозь корабли,
             # разрушает корабль в конечной точке. Атака 1.
             self.max_hits = 2
-            # Баланс v5: +1 move_range (на случай обычного перемещения;
-            # jump_range — отдельный авторитетный параметр).
-            self.move_range = 4
-            # Баланс v3: jump_range 3→2 (было имбой, убивал артиллерию в 1 таран
-            # на дальность 3). Сохраняем высокую мобильность за счёт move=3.
+            # Баланс v3: jump_range 3→2 (был имбой: убивал артиллерию в 1
+            # таран на дальность 3). Авторитетная дальность — jump_range;
+            # держим move_range синхронно, чтобы обычные (не таранные)
+            # перемещения тоже ограничивались jump_range (иначе move_range
+            # оставался «мёртвым кодом» — Devin Review #4).
             self.jump_range = 2
+            self.move_range = self.jump_range
             self.can_shoot = True
             self.shoot_range = 5
             self.shoot_anywhere = False

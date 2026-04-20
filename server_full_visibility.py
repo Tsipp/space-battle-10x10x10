@@ -1044,14 +1044,21 @@ class GameServer:
                 if ship is None:
                     self.log(f"❌ GM override: неизвестный ship_id {ship_id}", 'error')
                     return
-                x = msg.get('x', ship.x)
-                y = msg.get('y', ship.y)
-                z = msg.get('z', ship.z)
-                if not (0 <= x < 10 and 0 <= y < 10 and 0 <= z < 10):
+                # Приводим к int ДО проверки границ, чтобы JSON-числа с
+                # плавающей точкой (напр. 9.5) не проскакивали проверку
+                # `< 10` и не обрезались потом до 9 без сигнала (Devin Review #3).
+                try:
+                    x = int(msg.get('x', ship.x))
+                    y = int(msg.get('y', ship.y))
+                    z = int(msg.get('z', ship.z))
+                except (TypeError, ValueError):
+                    self.log("❌ GM override: координаты не приводятся к int", 'error')
+                    return
+                if not (0 <= x <= 9 and 0 <= y <= 9 and 0 <= z <= 9):
                     self.log(f"❌ GM override: ({x},{y},{z}) вне куба", 'error')
                     return
                 old = (ship.x, ship.y, ship.z, ship.alive)
-                ship.x, ship.y, ship.z = int(x), int(y), int(z)
+                ship.x, ship.y, ship.z = x, y, z
                 if 'alive' in msg:
                     ship.alive = bool(msg['alive'])
                 if 'hits' in msg:

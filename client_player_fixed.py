@@ -1048,18 +1048,45 @@ class GameClientGUI:
 
     def _legal_cells_for(self, ship, kind):
         """Возвращает множество (x,y,z) легальных клеток для хода или
-        выстрела конкретного корабля по его типу/диапазону."""
+        выстрела конкретного корабля по его типу/диапазону.
+
+        Баланс v7 / Devin Review #1: повторяет правила сервера из
+        ``_execute_move``. Для Прыгуна авторитетен ``jump_range`` (кулдаун
+        применяется отдельно на сервере, но для подсветки берём как верх).
+        Для Бурава эффективная дальность — ``max(move_range, drill_range)``,
+        а перемещение должно быть либо по одной оси, либо строго по
+        двум осям с равным модулем смещения (диагональ в плоскости)."""
         cells = set()
         sx, sy, sz = ship['x'], ship['y'], ship['z']
         if kind == 'move':
-            mr = ship.get('move_range', 1)
-            if mr <= 0:
+            ship_type = ship.get('ship_type') or ship.get('type')
+            jump_range = ship.get('jump_range', 0) or 0
+            drill_range = ship.get('drill_range', 0) or 0
+            move_range = ship.get('move_range', 1) or 0
+            is_jumper = ship_type == 'Прыгун' and jump_range > 0
+            is_drill = ship_type == 'Бурав' and drill_range > 0
+            if is_jumper:
+                effective_range = jump_range
+            elif is_drill:
+                effective_range = max(move_range, drill_range)
+            else:
+                effective_range = move_range
+            if effective_range <= 0:
                 return cells
-            for dx in range(-mr, mr + 1):
-                for dy in range(-mr, mr + 1):
-                    for dz in range(-mr, mr + 1):
+            for dx in range(-effective_range, effective_range + 1):
+                for dy in range(-effective_range, effective_range + 1):
+                    for dz in range(-effective_range, effective_range + 1):
                         if dx == 0 and dy == 0 and dz == 0:
                             continue
+                        if max(abs(dx), abs(dy), abs(dz)) > effective_range:
+                            continue
+                        if is_drill:
+                            nonzero = [v for v in (dx, dy, dz) if v != 0]
+                            axes = len(nonzero)
+                            if axes == 3:
+                                continue
+                            if axes == 2 and abs(nonzero[0]) != abs(nonzero[1]):
+                                continue
                         nx, ny, nz = sx + dx, sy + dy, sz + dz
                         if 0 <= nx < 10 and 0 <= ny < 10 and 0 <= nz < 10:
                             cells.add((nx, ny, nz))
