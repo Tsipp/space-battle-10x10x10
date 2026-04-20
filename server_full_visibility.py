@@ -569,8 +569,23 @@ class GameServer:
             'game_over': False,
             'winner': None,
             'last_hits': [],
-            'game_mode': game_mode
+            'game_mode': game_mode,
+            # Голограммы Провокатора (keyed by hologram id). Каждая — словарь
+            # {id, owner_team, x, y, z, alive, ship_type}. Видны всем командам,
+            # блокируют линию огня, умирают с одного попадания.
+            'holograms': {},
+            # Мины Паука. Список словарей {id, owner_team, x, y, z, damage}.
+            # Видны только команде-владельцу и GM; срабатывают при входе
+            # вражеского корабля в клетку.
+            'mines': [],
+            # События этого хода, не привязанные к попаданиям (лечение,
+            # фаза, установка мин/голограмм, срабатывание мин, тараны).
+            # Каждую фазу обнуляется.
+            'last_events': [],
         }
+        # Счётчики для генерации уникальных id голограмм/мин.
+        self._hologram_counter = 0
+        self._mine_counter = 0
         self.actions_received = {}
         self.running = True
 
@@ -698,21 +713,27 @@ class GameServer:
         self.log(f"✅ Создано {len(ships)} кораблей", 'success')
     
     def get_visible_enemies(self, team):
-        """Возвращает вражеские корабли в радиусе видимости"""
+        """Возвращает вражеские корабли в радиусе видимости.
+
+        Корабли в «фазе» (Тишина с `is_phased=True`) никогда не попадают
+        в результат — они невидимы противнику.
+        Голограммы врага показываются всегда, как если бы были кораблями,
+        чтобы их можно было принять за настоящий корабль и выстрелить.
+        """
         visible_enemies = {}
         team_ships = [s for s in self.game_state['ships'].values() if s.team == team and s.alive]
-        
+
         for ship in self.game_state['ships'].values():
-            if ship.team != team and ship.alive:
+            if ship.team != team and ship.alive and not getattr(ship, 'is_phased', False):
                 visible = False
-                
+
                 for ally in team_ships:
                     # Для радиовышки - видит всю плоскость Z
                     if self.game_mode == 'advanced' and ally.ship_type == ShipType.RADIO and ally.alive:
                         if ally.z == ship.z:
                             visible = True
                             break
-                    
+
                     # Обычная видимость (радиус 3 клетки)
                     distance = max(
                         abs(ship.x - ally.x),
@@ -722,10 +743,17 @@ class GameServer:
                     if distance <= 3:
                         visible = True
                         break
-                
+
                 if visible:
                     visible_enemies[ship.id] = ship.to_dict()
-        
+
+        # Вражеские голограммы: видны всегда как «корабли». У них поле
+        # is_hologram=True, чтобы клиент/бот при желании могли различить
+        # (по умолчанию пусть считает настоящим кораблём — цель декоя).
+        for holo in self.game_state.get('holograms', {}).values():
+            if holo.get('owner_team') != team.value and holo.get('alive', True):
+                visible_enemies[holo['id']] = dict(holo)
+
         return visible_enemies
     
     def get_full_map_for_game_master(self):
@@ -855,6 +883,18 @@ class GameServer:
                         my_ships[ship_id] = ship.to_dict()
                 visible_enemies = self.get_visible_enemies(team)
 
+                # Собственные голограммы — видны команде-владельцу.
+                own_holograms = {
+                    hid: dict(holo)
+                    for hid, holo in self.game_state.get('holograms', {}).items()
+                    if holo.get('owner_team') == team.value and holo.get('alive', True)
+                }
+                # Свои мины — видны только команде-владельцу.
+                own_mines = [
+                    dict(mine) for mine in self.game_state.get('mines', [])
+                    if mine.get('owner_team') == team.value
+                ]
+
                 state = {
                     'turn': self.game_state['turn'],
                     'my_ships': my_ships,
@@ -866,9 +906,12 @@ class GameServer:
                     'winner': self.game_state['winner'],
                     'game_mode': self.game_state['game_mode'],
                     'last_hits': self.game_state['last_hits'],
+                    'last_events': self.game_state.get('last_events', []),
                     'hit_history': self.game_state['hit_history'],
                     'planning_deadline': self.planning_deadline,
                     'planning_timeout': self.planning_timeout,
+                    'holograms': own_holograms,
+                    'mines': own_mines,
                 }
             framed.send(state)
         except Exception as e:
@@ -989,6 +1032,13 @@ class GameServer:
         try:
             with self.state_lock:
                 all_ships = self.get_full_map_for_game_master()
+                # GM видит всё: голограммы и мины всех команд.
+                all_holograms = {
+                    hid: dict(holo)
+                    for hid, holo in self.game_state.get('holograms', {}).items()
+                    if holo.get('alive', True)
+                }
+                all_mines = [dict(m) for m in self.game_state.get('mines', [])]
                 state = {
                     'type': 'game_master',
                     'turn': self.game_state['turn'],
@@ -997,6 +1047,7 @@ class GameServer:
                     'game_over': self.game_state['game_over'],
                     'winner': self.game_state['winner'],
                     'last_hits': self.game_state['last_hits'],
+                    'last_events': self.game_state.get('last_events', []),
                     'hit_history': self.game_state['hit_history'],
                     'message': f'Ход {self.game_state["turn"] + 1} - {self.game_state["phase"]}',
                     'game_mode': self.game_state['game_mode'],
@@ -1004,6 +1055,8 @@ class GameServer:
                     'planning_timeout': self.planning_timeout,
                     'actions_received_teams': [t.value for t in self.actions_received.keys()],
                     'connected_teams': [t.value for t in self.clients.keys()],
+                    'holograms': all_holograms,
+                    'mines': all_mines,
                 }
             self.game_master_framed.send(state)
             self.log(f"📊 Отправлена полная карта гейммастеру", 'info')
@@ -1102,8 +1155,65 @@ class GameServer:
 
         ships = self.game_state['ships']
         self.game_state['last_hits'] = []
+        self.game_state['last_events'] = []
 
-        # ==== ФАЗА 1: ПЕРЕМЕЩЕНИЯ ====
+        # ==== ФАЗА 0: PHASE (неуязвимость) ====
+        # Делается ПЕРВОЙ, чтобы включение/выключение фазы действовало
+        # уже в этот же ход на движение/выстрелы/мины/тараны.
+        for team, actions in self.actions_received.items():
+            for action in actions:
+                if action.action_type != ActionType.PHASE:
+                    continue
+                ship = ships.get(action.ship_id)
+                if not ship or not ship.alive or ship.team != team:
+                    continue
+                if not ship.can_phase:
+                    self.log(f"   ⚠️ {ship.name} не может уходить в фазу", 'warning')
+                    continue
+                ship.is_phased = not ship.is_phased
+                msg = f"🌀 {ship.name}: фаза {'ВКЛ' if ship.is_phased else 'ВЫКЛ'}"
+                self.log(f"   {msg}", 'info')
+                self.game_state['last_events'].append({
+                    'turn': self.game_state['turn'] + 1,
+                    'type': 'phase_toggle',
+                    'team': team.value,
+                    'ship_name': ship.name,
+                    'is_phased': ship.is_phased,
+                })
+
+        # ==== ФАЗА 1: HOLOGRAM (Провокатор) ====
+        for team, actions in self.actions_received.items():
+            for action in actions:
+                if action.action_type != ActionType.HOLOGRAM:
+                    continue
+                ship = ships.get(action.ship_id)
+                if not ship or not ship.alive or ship.team != team:
+                    continue
+                if not ship.can_create_hologram:
+                    self.log(f"   ⚠️ {ship.name} не умеет создавать голограммы", 'warning')
+                    continue
+                tx, ty, tz = action.target_x, action.target_y, action.target_z
+                if tx is None or ty is None or tz is None:
+                    continue
+                self._spawn_hologram(ship, team, tx, ty, tz)
+
+        # ==== ФАЗА 2: MINE (Паук) ====
+        for team, actions in self.actions_received.items():
+            for action in actions:
+                if action.action_type != ActionType.MINE:
+                    continue
+                ship = ships.get(action.ship_id)
+                if not ship or not ship.alive or ship.team != team:
+                    continue
+                if not ship.can_place_mine:
+                    self.log(f"   ⚠️ {ship.name} не умеет ставить мины", 'warning')
+                    continue
+                tx, ty, tz = action.target_x, action.target_y, action.target_z
+                if tx is None or ty is None or tz is None:
+                    continue
+                self._place_mine(ship, team, tx, ty, tz)
+
+        # ==== ФАЗА 3: ПЕРЕМЕЩЕНИЯ ====
         self.log("\n📦 ПЕРЕМЕЩЕНИЯ:", 'info')
         for team, actions in self.actions_received.items():
             for action in actions:
@@ -1112,36 +1222,19 @@ class GameServer:
                 ship = ships.get(action.ship_id)
                 if not ship or not ship.alive or ship.team != team:
                     continue
-                if ship.move_range <= 0:
+                if ship.move_range <= 0 and ship.jump_range <= 0 and ship.drill_range <= 0:
                     self.log(f"   ⚠️ {ship.name}: не может двигаться", 'warning')
                     continue
-
-                # Коллизия: целевая клетка не должна быть занята другим
-                # живым кораблём (ни своим, ни чужим). Порядок обработки
-                # зависит от порядка actions_received — это задокументировано
-                # поведение: если двое целятся в одну клетку, попадёт тот,
-                # чьё действие обработано раньше.
                 tx, ty, tz = action.target_x, action.target_y, action.target_z
-                occupied = any(
-                    other.alive and other.id != ship.id
-                    and other.x == tx and other.y == ty and other.z == tz
-                    for other in ships.values()
-                )
-                if occupied:
-                    self.log(f"   ⚠️ {ship.name}: клетка ({tx},{ty},{tz}) занята", 'warning')
+                if tx is None or ty is None or tz is None:
                     continue
+                self._execute_move(ship, tx, ty, tz)
 
-                old_pos = (ship.x, ship.y, ship.z)
-                if ship.move(tx, ty, tz):
-                    self.log(f"   {ship.name}: {old_pos} → ({ship.x},{ship.y},{ship.z})", 'info')
-                else:
-                    self.log(f"   ⚠️ {ship.name}: недопустимое перемещение", 'warning')
-
-        # ==== ФАЗА 2: ВЫСТРЕЛЫ (симультанно) ====
+        # ==== ФАЗА 4: ВЫСТРЕЛЫ (симультанно) ====
         # Сначала для каждого выстрела определяем, в кого он попадает (если
         # вообще попадает). Урон применяем только после обработки всех выстрелов.
         self.log("\n🎯 ВЫСТРЕЛЫ:", 'info')
-        hit_records = []  # список (attacker_ship, target_ship, position_tuple)
+        hit_records = []  # (attacker_ship, target, position_tuple, kind)
         missiles_fired = 0
 
         for team, actions in self.actions_received.items():
@@ -1154,23 +1247,42 @@ class GameServer:
                 if not ship.can_shoot:
                     self.log(f"   ⚠️ {ship.name} не может стрелять", 'warning')
                     continue
+                if getattr(ship, 'is_phased', False):
+                    self.log(f"   ⚠️ {ship.name} в фазе и не стреляет", 'warning')
+                    continue
                 if not ship.can_shoot_at(action.target_x, action.target_y, action.target_z):
                     self.log(f"   ⚠️ {ship.name}: недопустимая цель", 'warning')
                     continue
 
                 missiles_fired += 1
-                target_ship, position = self._resolve_shot(ship, action)
-                if target_ship is not None:
-                    hit_records.append((ship, target_ship, position))
+                target, position, kind = self._resolve_shot(ship, action)
+                if target is not None:
+                    hit_records.append((ship, target, position, kind))
 
         # Применяем урон одним залпом — корабль мог погибнуть, но он всё равно
         # должен был успеть выстрелить в этот же ход.
-        for attacker, target, pos in hit_records:
+        for attacker, target, pos, kind in hit_records:
+            if kind == 'hologram':
+                # Голограмма «лопается» от любого попадания и исчезает.
+                target['alive'] = False
+                self.log(
+                    f"   💥 {attacker.name} раскрыл голограмму {target['id']} в {pos}",
+                    'success',
+                )
+                self.game_state['last_events'].append({
+                    'turn': self.game_state['turn'] + 1,
+                    'type': 'hologram_destroyed',
+                    'attacker': attacker.team.value,
+                    'attacker_name': attacker.name,
+                    'hologram_id': target['id'],
+                    'owner': target['owner_team'],
+                    'position': f"({pos[0]},{pos[1]},{pos[2]})",
+                })
+                continue
             already_dead = not target.alive
             if already_dead:
-                # Несколько попаданий в уже мёртвый корабль — всё равно лог.
                 self.log(f"   💀 {attacker.name} добивает {target.name}", 'info')
-            target.take_hit()
+            target.take_hit(damage=attacker.damage)
             killed = (not target.alive) and not already_dead
             hit_info = {
                 'turn': self.game_state['turn'] + 1,
@@ -1179,15 +1291,29 @@ class GameServer:
                 'target': target.team.value,
                 'target_name': target.name,
                 'position': f"({pos[0]},{pos[1]},{pos[2]})",
+                'damage': attacker.damage,
                 'killed': killed,
             }
             self.game_state['last_hits'].append(hit_info)
             self.game_state['hit_history'].append(hit_info)
-            self.log(f"   ✅ {attacker.name} поразил {target.name}!", 'success')
+            self.log(f"   ✅ {attacker.name} поразил {target.name} ({attacker.damage} урона)!", 'success')
+
+        # ==== ФАЗА 5: HEAL (Факел) ====
+        for team, actions in self.actions_received.items():
+            for action in actions:
+                if action.action_type != ActionType.HEAL:
+                    continue
+                ship = ships.get(action.ship_id)
+                if not ship or not ship.alive or ship.team != team:
+                    continue
+                if ship.heal_range <= 0:
+                    self.log(f"   ⚠️ {ship.name} не умеет лечить", 'warning')
+                    continue
+                self._apply_heal(ship, team)
 
         hits = [
-            f"{a.name} ({a.team.value}) → {t.name} ({t.team.value})"
-            for (a, t, _) in hit_records
+            f"{a.name} ({a.team.value}) → {self._target_label(t, k)}"
+            for (a, t, _, k) in hit_records
         ]
 
         self.log(f"   Выпущено ракет: {missiles_fired}", 'info')
@@ -1229,23 +1355,36 @@ class GameServer:
     def _resolve_shot(self, attacker, action):
         """Определяет, в кого попадает выстрел.
 
-        Возвращает (target_ship, (x,y,z)) или (None, None).
+        Возвращает (target, (x,y,z), kind), где kind ∈ {'ship', 'hologram'},
+        или (None, None, None).
 
+        - Корабли в фазе (``is_phased=True``) игнорируются: они прозрачны для
+          стрельбы и не блокируют линию огня.
         - Артиллерия: точечный удар в клетку (attacker уже прошёл can_shoot_at).
-          Поражает любой живой корабль команды-противника в этой клетке.
+          Поражает любой живой корабль команды-противника в этой клетке
+          (или голограмму противника).
         - Обычный выстрел: пуля летит по прямой по одной оси. Блокируется
-          ПЕРВЫМ живым кораблём на линии (своим или чужим). Засчитывается
-          попадание, только если этот корабль — из команды противника.
+          первым живым кораблём/голограммой на линии. Союзник гасит,
+          противник/голограмма противника засчитываются как попадание.
         """
         ships = self.game_state['ships']
+        holograms = self.game_state.get('holograms', {})
         tx, ty, tz = action.target_x, action.target_y, action.target_z
 
         if attacker.ship_type == ShipType.ARTILLERY:
+            # Сначала ищем корабль-цель (не в фазе).
             for target in ships.values():
                 if (target.alive and target.team != attacker.team
+                        and not getattr(target, 'is_phased', False)
                         and target.x == tx and target.y == ty and target.z == tz):
-                    return target, (tx, ty, tz)
-            return None, None
+                    return target, (tx, ty, tz), 'ship'
+            # Затем голограмму (тоже засчитывается как цель — декой работает).
+            for holo in holograms.values():
+                if (holo.get('alive', True)
+                        and holo.get('owner_team') != attacker.team.value
+                        and (holo['x'], holo['y'], holo['z']) == (tx, ty, tz)):
+                    return holo, (tx, ty, tz), 'hologram'
+            return None, None, None
 
         # Определяем ось и шаг
         if tx != attacker.x:
@@ -1261,7 +1400,7 @@ class GameServer:
             step = 1 if tz > attacker.z else -1
             distance = min(attacker.shoot_range, abs(tz - attacker.z))
         else:
-            return None, None
+            return None, None, None
 
         for i in range(1, distance + 1):
             if axis == 'x':
@@ -1271,25 +1410,344 @@ class GameServer:
             else:
                 cell = (attacker.x, attacker.y, attacker.z + i * step)
 
-            blocker = next(
+            # Фазированные корабли прозрачны для стрельбы.
+            blocker_ship = next(
                 (s for s in ships.values()
                  if s.alive and s.id != attacker.id
+                 and not getattr(s, 'is_phased', False)
                  and (s.x, s.y, s.z) == cell),
                 None,
             )
-            if blocker is None:
+            blocker_holo = next(
+                (h for h in holograms.values()
+                 if h.get('alive', True)
+                 and (h['x'], h['y'], h['z']) == cell),
+                None,
+            )
+            if blocker_ship is None and blocker_holo is None:
                 continue
-            # Первый корабль на линии огня блокирует выстрел.
-            if blocker.team != attacker.team:
-                return blocker, cell
-            # Союзник загородил цель — выстрел гасится, попадания нет.
+            # Корабль ближе/или вместе с голограммой: корабль приоритетнее.
+            if blocker_ship is not None:
+                if blocker_ship.team != attacker.team:
+                    return blocker_ship, cell, 'ship'
+                # Союзник загородил цель — выстрел гасится, попадания нет.
+                self.log(
+                    f"   🛡️ Выстрел {attacker.name} заблокирован союзником {blocker_ship.name} в {cell}",
+                    'warning',
+                )
+                return None, None, None
+            # Голограмма на линии.
+            if blocker_holo.get('owner_team') != attacker.team.value:
+                return blocker_holo, cell, 'hologram'
+            # Своя голограмма — гасит выстрел.
             self.log(
-                f"   🛡️ Выстрел {attacker.name} заблокирован союзником {blocker.name} в {cell}",
+                f"   🛡️ Выстрел {attacker.name} гасится собственной голограммой в {cell}",
                 'warning',
             )
-            return None, None
+            return None, None, None
 
-        return None, None
+        return None, None, None
+
+    # -----------------------------------------------------------
+    # Вспомогательные методы для новых способностей
+    # -----------------------------------------------------------
+
+    def _target_label(self, target, kind):
+        """Форматирует цель для итогового списка попаданий."""
+        if kind == 'hologram':
+            owner = target.get('owner_team', '?')
+            return f"голограмма {target.get('id', '?')} ({owner})"
+        return f"{target.name} ({target.team.value})"
+
+    def _spawn_hologram(self, ship, team, tx, ty, tz):
+        """Создаёт голограмму рядом с Провокатором.
+
+        Требования: клетка в пределах 1 (Чебышёв), в пределах карты,
+        не совпадает с живым кораблём и не занята другой голограммой.
+        """
+        if not (0 <= tx <= 9 and 0 <= ty <= 9 and 0 <= tz <= 9):
+            self.log(f"   ⚠️ {ship.name}: голограмма вне карты", 'warning')
+            return False
+        dist = max(abs(tx - ship.x), abs(ty - ship.y), abs(tz - ship.z))
+        if dist == 0 or dist > 1:
+            self.log(
+                f"   ⚠️ {ship.name}: голограмма не в соседней клетке (dist={dist})",
+                'warning',
+            )
+            return False
+        ships = self.game_state['ships']
+        if any(s.alive and (s.x, s.y, s.z) == (tx, ty, tz) for s in ships.values()):
+            self.log(f"   ⚠️ {ship.name}: клетка ({tx},{ty},{tz}) занята кораблём", 'warning')
+            return False
+        holograms = self.game_state['holograms']
+        if any(h.get('alive', True) and (h['x'], h['y'], h['z']) == (tx, ty, tz)
+               for h in holograms.values()):
+            self.log(f"   ⚠️ {ship.name}: клетка ({tx},{ty},{tz}) уже занята голограммой", 'warning')
+            return False
+        self._hologram_counter += 1
+        hid = f"H{self._hologram_counter}"
+        holograms[hid] = {
+            'id': hid,
+            'owner_team': team.value,
+            'x': tx, 'y': ty, 'z': tz,
+            'alive': True,
+            'ship_type': ship.ship_type.value,
+            'is_hologram': True,
+            # Фикция «корабельных» полей, чтобы клиент рисовал как корабль.
+            'team': team.value,
+            'name': f"Голограмма {hid}",
+            'max_hits': 1,
+            'hits': 0,
+            'can_shoot': False,
+            'move_range': 0,
+            'shoot_range': 0,
+        }
+        self.log(f"   🪞 {ship.name} создал голограмму {hid} в ({tx},{ty},{tz})", 'info')
+        self.game_state['last_events'].append({
+            'turn': self.game_state['turn'] + 1,
+            'type': 'hologram_spawned',
+            'owner': team.value,
+            'ship_name': ship.name,
+            'hologram_id': hid,
+            'position': f"({tx},{ty},{tz})",
+        })
+        return True
+
+    def _place_mine(self, ship, team, tx, ty, tz):
+        """Ставит мину Паука в соседней клетке."""
+        if not (0 <= tx <= 9 and 0 <= ty <= 9 and 0 <= tz <= 9):
+            self.log(f"   ⚠️ {ship.name}: мина вне карты", 'warning')
+            return False
+        dist = max(abs(tx - ship.x), abs(ty - ship.y), abs(tz - ship.z))
+        if dist == 0 or dist > 1:
+            self.log(
+                f"   ⚠️ {ship.name}: мина не в соседней клетке (dist={dist})",
+                'warning',
+            )
+            return False
+        ships = self.game_state['ships']
+        if any(s.alive and (s.x, s.y, s.z) == (tx, ty, tz) for s in ships.values()):
+            self.log(f"   ⚠️ {ship.name}: клетка ({tx},{ty},{tz}) занята кораблём", 'warning')
+            return False
+        mines = self.game_state['mines']
+        if any((m['x'], m['y'], m['z']) == (tx, ty, tz) for m in mines):
+            self.log(f"   ⚠️ {ship.name}: в клетке уже стоит мина", 'warning')
+            return False
+        self._mine_counter += 1
+        mid = f"M{self._mine_counter}"
+        mines.append({
+            'id': mid,
+            'owner_team': team.value,
+            'x': tx, 'y': ty, 'z': tz,
+            'damage': ship.mine_damage,
+        })
+        self.log(f"   💣 {ship.name} установил мину {mid} в ({tx},{ty},{tz})", 'info')
+        self.game_state['last_events'].append({
+            'turn': self.game_state['turn'] + 1,
+            'type': 'mine_placed',
+            'owner': team.value,
+            'ship_name': ship.name,
+            'mine_id': mid,
+            'position': f"({tx},{ty},{tz})",
+        })
+        return True
+
+    def _check_mine_trigger(self, ship):
+        """Если в текущей клетке корабля стоит вражеская мина — детонирует
+        её: наносит урон и удаляет мину. Возвращает True, если корабль погиб.
+        """
+        mines = self.game_state['mines']
+        for idx, mine in enumerate(mines):
+            if mine['owner_team'] == ship.team.value:
+                continue
+            if (mine['x'], mine['y'], mine['z']) != (ship.x, ship.y, ship.z):
+                continue
+            mine = mines.pop(idx)
+            already_dead = not ship.alive
+            if getattr(ship, 'is_phased', False):
+                # Фазированный корабль не принимает урона, но разрешает мине
+                # «прогореть» (snoop по дизайну). Минимальный вариант — мина
+                # срабатывает, но урон 0. Оставим срабатывание и факт.
+                damage_applied = 0
+            else:
+                damage_applied = mine.get('damage', 1)
+                ship.take_hit(damage=damage_applied)
+            killed = (not ship.alive) and not already_dead
+            self.log(
+                f"   💥 Мина {mine['id']} сработала под {ship.name} "
+                f"(урон {damage_applied}){' — КОРАБЛЬ УНИЧТОЖЕН' if killed else ''}",
+                'warning',
+            )
+            event = {
+                'turn': self.game_state['turn'] + 1,
+                'type': 'mine_detonated',
+                'owner': mine['owner_team'],
+                'mine_id': mine['id'],
+                'target': ship.team.value,
+                'target_name': ship.name,
+                'position': f"({ship.x},{ship.y},{ship.z})",
+                'damage': damage_applied,
+                'killed': killed,
+            }
+            self.game_state['last_events'].append(event)
+            self.game_state['hit_history'].append(event)
+            return killed
+        return False
+
+    def _execute_move(self, ship, tx, ty, tz):
+        """Выполняет перемещение корабля с учётом особых способностей
+        (Прыгун, Бурав). Возвращает True при успехе.
+        """
+        if not (0 <= tx <= 9 and 0 <= ty <= 9 and 0 <= tz <= 9):
+            self.log(f"   ⚠️ {ship.name}: цель ({tx},{ty},{tz}) вне карты", 'warning')
+            return False
+        if (tx, ty, tz) == (ship.x, ship.y, ship.z):
+            return False
+
+        ships = self.game_state['ships']
+        holograms = self.game_state['holograms']
+
+        dx = abs(tx - ship.x)
+        dy = abs(ty - ship.y)
+        dz = abs(tz - ship.z)
+        dist = max(dx, dy, dz)
+
+        is_jumper = ship.ship_type == ShipType.JUMPER and ship.jump_range > 0
+        is_drill = ship.ship_type == ShipType.DRILL and ship.drill_range > 0
+
+        effective_range = ship.move_range
+        if is_jumper:
+            effective_range = max(effective_range, ship.jump_range)
+        if is_drill:
+            effective_range = max(effective_range, ship.drill_range)
+
+        if dist > effective_range:
+            self.log(
+                f"   ⚠️ {ship.name}: дистанция {dist} > допустимой {effective_range}",
+                'warning',
+            )
+            return False
+
+        if is_drill:
+            axes_changed = (1 if dx else 0) + (1 if dy else 0) + (1 if dz else 0)
+            if axes_changed != 1:
+                self.log(f"   ⚠️ {ship.name}: Бурав двигается только по одной оси", 'warning')
+                return False
+
+        target_ship = next(
+            (s for s in ships.values()
+             if s.alive and s.id != ship.id and (s.x, s.y, s.z) == (tx, ty, tz)),
+            None,
+        )
+        target_holo = next(
+            (h for h in holograms.values()
+             if h.get('alive', True) and (h['x'], h['y'], h['z']) == (tx, ty, tz)),
+            None,
+        )
+
+        old_pos = (ship.x, ship.y, ship.z)
+
+        if is_jumper or is_drill:
+            # Таран: в конечной клетке любой вражеский корабль/голограмма
+            # уничтожаются. Союзник — движение отменяется.
+            if target_ship is not None:
+                if target_ship.team == ship.team:
+                    self.log(
+                        f"   ⚠️ {ship.name}: в конечной клетке ({tx},{ty},{tz}) свой корабль {target_ship.name}",
+                        'warning',
+                    )
+                    return False
+                if getattr(target_ship, 'is_phased', False):
+                    self.log(
+                        f"   ⚠️ {ship.name}: цель {target_ship.name} в фазе — таран не прошёл",
+                        'warning',
+                    )
+                    return False
+                # Убиваем тараном
+                target_ship.alive = False
+                target_ship.hits = target_ship.max_hits
+                ram_event = {
+                    'turn': self.game_state['turn'] + 1,
+                    'attacker': ship.team.value,
+                    'attacker_name': ship.name,
+                    'target': target_ship.team.value,
+                    'target_name': target_ship.name,
+                    'position': f"({tx},{ty},{tz})",
+                    'damage': target_ship.max_hits,
+                    'killed': True,
+                    'ram': True,
+                    'type': 'ram_kill',
+                }
+                self.game_state['last_hits'].append(ram_event)
+                self.game_state['hit_history'].append(ram_event)
+                self.game_state['last_events'].append(ram_event)
+                self.log(
+                    f"   💥 {ship.name} тараном уничтожил {target_ship.name} в ({tx},{ty},{tz})",
+                    'success',
+                )
+            if target_holo is not None and target_holo.get('owner_team') != ship.team.value:
+                target_holo['alive'] = False
+                self.game_state['last_events'].append({
+                    'turn': self.game_state['turn'] + 1,
+                    'type': 'hologram_destroyed',
+                    'attacker': ship.team.value,
+                    'attacker_name': ship.name,
+                    'hologram_id': target_holo['id'],
+                    'owner': target_holo['owner_team'],
+                    'position': f"({tx},{ty},{tz})",
+                    'ram': True,
+                })
+                self.log(
+                    f"   💥 {ship.name} тараном сбросил голограмму {target_holo['id']}",
+                    'success',
+                )
+            elif target_holo is not None and target_holo.get('owner_team') == ship.team.value:
+                # Наступили на свою голограмму — она остаётся, корабль просто
+                # занимает её клетку? По дизайну свою голограмму можно «сбить»,
+                # не теряя ход; считаем что она исчезает.
+                target_holo['alive'] = False
+        else:
+            if target_ship is not None or (target_holo is not None and target_holo.get('alive', True)):
+                self.log(f"   ⚠️ {ship.name}: клетка ({tx},{ty},{tz}) занята", 'warning')
+                return False
+
+        # Перемещаем (минуем Ship.move, так как эффективная дальность выше move_range
+        # для Прыгуна и Бурава).
+        ship.x, ship.y, ship.z = tx, ty, tz
+        self.log(f"   {ship.name}: {old_pos} → ({tx},{ty},{tz})", 'info')
+
+        # Проверяем срабатывание мины в конечной клетке.
+        self._check_mine_trigger(ship)
+        return True
+
+    def _apply_heal(self, ship, team):
+        """Факел лечит всех живых союзников в радиусе ``heal_range``
+        (включая себя), восстанавливая 1 hp каждому раненому."""
+        ships = self.game_state['ships']
+        healed = []
+        for ally in ships.values():
+            if ally.team != team or not ally.alive:
+                continue
+            d = max(abs(ally.x - ship.x), abs(ally.y - ship.y), abs(ally.z - ship.z))
+            if d > ship.heal_range:
+                continue
+            if ally.hits > 0 and ally.heal(amount=1):
+                healed.append(ally)
+                self.log(
+                    f"   💚 {ship.name} лечит {ally.name} → hits={ally.hits}/{ally.max_hits}",
+                    'success',
+                )
+        if healed:
+            self.game_state['last_events'].append({
+                'turn': self.game_state['turn'] + 1,
+                'type': 'heal',
+                'healer': ship.name,
+                'team': team.value,
+                'healed': [a.name for a in healed],
+            })
+        else:
+            self.log(f"   ⚠️ {ship.name}: некого лечить", 'warning')
+        return len(healed)
 
     def main_loop(self):
         self.log("\n⏳ ОЖИДАНИЕ ПОДКЛЮЧЕНИЙ...", 'system')

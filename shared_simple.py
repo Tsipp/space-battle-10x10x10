@@ -11,6 +11,11 @@ class Team(Enum):
 class ActionType(Enum):
     MOVE = "move"
     SHOOT = "shoot"
+    # Новые действия для спец-способностей (advanced-режим).
+    HEAL = "heal"          # Факел: AoE-лечение союзников в heal_range.
+    PHASE = "phase"        # Тишина: переключить фазу (неуязвимость).
+    HOLOGRAM = "hologram"  # Провокатор: разместить голограмму в клетке.
+    MINE = "mine"          # Паук: поставить мину в клетку.
 
 
 class ShipType(Enum):
@@ -39,6 +44,9 @@ class Ship:
         self.z = z
         self.alive = True
         self.ship_type = ship_type
+        # Флаг «фазы» для Тишины. Когда True, корабль неуязвим и не виден
+        # противникам. Переключается действием PHASE.
+        self.is_phased = False
 
         # Безопасные значения по умолчанию — заданы для ВСЕХ типов,
         # чтобы не было AttributeError при обращении к атрибуту вне зависимости
@@ -218,11 +226,30 @@ class Ship:
 
         return distance <= self.shoot_range
 
-    def take_hit(self):
-        self.hits += 1
+    def take_hit(self, damage=1):
+        """Наносит кораблю ``damage`` единиц урона. По умолчанию 1 — так
+        ведут себя все базовые выстрелы в старом коде. Если damage > 0
+        и это приводит к ``hits >= max_hits``, корабль помечается как
+        мёртвый (``alive=False``).
+        """
+        if damage <= 0:
+            return self.alive
+        self.hits += damage
         if self.hits >= self.max_hits:
             self.alive = False
         return self.alive
+
+    def heal(self, amount=1):
+        """Восстанавливает кораблю до ``amount`` единиц здоровья
+        (уменьшает ``hits``, не ниже нуля). Мёртвых кораблей не оживляет.
+        """
+        if not self.alive or amount <= 0:
+            return False
+        new_hits = max(0, self.hits - amount)
+        if new_hits == self.hits:
+            return False
+        self.hits = new_hits
+        return True
 
     def to_dict(self):
         return {
@@ -240,6 +267,7 @@ class Ship:
             'shoot_anywhere': getattr(self, 'shoot_anywhere', False),
             'scan_whole_z': getattr(self, 'scan_whole_z', False),
             'ship_type': self.ship_type.value,
+            'is_phased': getattr(self, 'is_phased', False),
             # Статы новых типов — для клиента и будущей логики.
             'damage': getattr(self, 'damage', 1),
             'jump_range': getattr(self, 'jump_range', 0),

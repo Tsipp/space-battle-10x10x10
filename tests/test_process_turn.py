@@ -97,7 +97,8 @@ class TestArtilleryPointStrike:
             Team.TEAM_B: [],
         }
         server.process_turn()
-        assert target.hits == 1
+        # Артиллерия по ТЗ наносит 2 ед. урона.
+        assert target.hits == 2
 
     def test_artillery_not_blocked_by_ally_between(self, server):
         # Артиллерия бьёт по координате — союзник между атакующим и целью не блокирует.
@@ -111,7 +112,7 @@ class TestArtilleryPointStrike:
             Team.TEAM_B: [],
         }
         server.process_turn()
-        assert target.hits == 1
+        assert target.hits == 2
         assert ally_middle.hits == 0
 
 
