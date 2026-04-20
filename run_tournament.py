@@ -149,6 +149,94 @@ def run_tournament(
         ]
         lines.append("| " + " | ".join(row) + " |")
 
+    # ---- Таблица по типам кораблей (для балансировки) --------------------
+    lines.append("")
+    lines.append("## Таблица по типам кораблей (балансировка)")
+    lines.append("")
+    lines.append(
+        "Агрегировано по всем трём командам во всех партиях. На каждую партию "
+        "выставляется по 3 корабля каждого типа (всего 9 за игру), поэтому "
+        f"«Всего» ≈ количество экземпляров типа во всех {games} играх. "
+        "«Урон/корабль» — средний урон, который корабль этого типа нанёс за "
+        "партию (damage_dealt / deployed). «Убийств/смертей» — как часто "
+        "корабль этого типа убивает / гибнет (на 1 экз.). «Выживаемость» — "
+        "доля экземпляров, доживших до конца партии. «HP %» — доля "
+        "оставшегося hp у выживших (hp_left / max_hp среди выживших)."
+    )
+    lines.append("")
+    type_header = [
+        "Тип", "Всего", "Выжило", "Выживаемость", "HP %",
+        "Урон нанёс", "Урон принял", "Урон/корабль",
+        "Убийств", "Смертей", "K/D",
+        "Попаданий", "Таранов+", "Мин сработ+", "Мин по нему", "Hеaled+", "Healed−",
+        "MOVE", "SHOOT", "HEAL", "PHASE", "HOLO", "MINE", "SKIP",
+    ]
+    lines.append("| " + " | ".join(type_header) + " |")
+    lines.append("|" + "|".join(["---"] * len(type_header)) + "|")
+
+    # Собираем агрегат по типу.
+    agg_type: dict[str, dict] = {}
+    for r in results:
+        for tp, s in r.get("type_stats", {}).items():
+            if tp not in agg_type:
+                agg_type[tp] = {
+                    k: 0 for k in s.keys()
+                }
+            for k, v in s.items():
+                agg_type[tp][k] = agg_type[tp].get(k, 0) + v
+
+    # Сортируем по «весу»: убийства + damage_dealt.
+    def _sort_key(kv):
+        tp, s = kv
+        return -(s.get("kills", 0) * 10 + s.get("damage_dealt", 0))
+
+    for tp, s in sorted(agg_type.items(), key=_sort_key):
+        deployed = s.get("deployed", 0)
+        survived_hp = s.get("survivor_hp_sum", 0)
+        max_hp_sum = s.get("survivor_hp_max_sum", 0)
+        # «выжило» = сколько раз корабль дожил до конца партии.
+        # У нас нет прямого счётчика, считаем через сумму max_hp выживших / max_hp одного экз.
+        # Но max_hp зависит только от типа, поэтому: survived = survivor_hp_max_sum / per_ship_max_hp.
+        # Нам доступно только суммарное max_hp. Узнаем через deployed — pr game на команду 1.
+        # Проще: max_hp одного экземпляра = max_hp_sum / survivor_count, но сами хотим survivor_count.
+        # Альтернатива: считать deaths, и survivor = deployed - deaths.
+        deaths = s.get("deaths", 0)
+        survived = max(deployed - deaths, 0)
+        surv_rate = (survived / deployed * 100.0) if deployed else 0.0
+        hp_pct = (survived_hp / max_hp_sum * 100.0) if max_hp_sum else 0.0
+        dmg_per_ship = (s.get("damage_dealt", 0) / deployed) if deployed else 0.0
+        kills_per_ship = (s.get("kills", 0) / deployed) if deployed else 0.0
+        deaths_per_ship = (deaths / deployed) if deployed else 0.0
+        kd = (s.get("kills", 0) / deaths) if deaths else float('inf') if s.get("kills", 0) else 0.0
+        kd_str = "∞" if kd == float('inf') else f"{kd:.2f}"
+        row = [
+            tp,
+            str(deployed),
+            str(survived),
+            f"{surv_rate:.1f}%",
+            f"{hp_pct:.0f}%" if max_hp_sum else "—",
+            str(s.get("damage_dealt", 0)),
+            str(s.get("damage_taken", 0)),
+            f"{dmg_per_ship:.2f}",
+            f"{s.get('kills', 0)} ({kills_per_ship:.2f})",
+            f"{deaths} ({deaths_per_ship:.2f})",
+            kd_str,
+            str(s.get("shots_hit", 0)),
+            str(s.get("rams_scored", 0)),
+            str(s.get("mines_dealt", 0)),
+            str(s.get("mines_received", 0)),
+            f"{s.get('heals_given', 0):.0f}",
+            str(s.get("heals_received", 0)),
+            str(s.get("action_move", 0)),
+            str(s.get("action_shoot", 0)),
+            str(s.get("action_heal", 0)),
+            str(s.get("action_phase", 0)),
+            str(s.get("action_hologram", 0)),
+            str(s.get("action_mine", 0)),
+            str(s.get("skip_turns", 0)),
+        ]
+        lines.append("| " + " | ".join(row) + " |")
+
     # ---- Побочные метрики -------------------------------------------------
     lines.append("")
     lines.append("### Дополнительно")

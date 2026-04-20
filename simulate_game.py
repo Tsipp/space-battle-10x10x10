@@ -458,6 +458,43 @@ def simulate(
         Team.TEAM_C.value: _team_stats_zero(),
     }
 
+    # Статистика по типам кораблей для балансировки.
+    ships_ref = server.game_state['ships']
+    id_to_type: dict[str, str] = {
+        sid: s.ship_type.value for sid, s in ships_ref.items()
+    }
+    type_stats: dict[str, dict] = {}
+
+    def _ensure_type(tp: str) -> dict:
+        if tp not in type_stats:
+            type_stats[tp] = {
+                'deployed': 0,
+                'damage_dealt': 0,
+                'damage_taken': 0,
+                'shots_hit': 0,
+                'rams_scored': 0,
+                'rams_received': 0,
+                'mines_dealt': 0,          # срабатываний своих мин
+                'mines_received': 0,       # срабатываний чужих мин по этому типу
+                'kills': 0,
+                'deaths': 0,
+                'heals_given': 0,          # сколько hp восстановлено факелом
+                'heals_received': 0,       # сколько hp восстановлено этому типу
+                'action_move': 0,
+                'action_shoot': 0,
+                'action_heal': 0,
+                'action_phase': 0,
+                'action_hologram': 0,
+                'action_mine': 0,
+                'skip_turns': 0,
+                'survivor_hp_sum': 0,
+                'survivor_hp_max_sum': 0,
+            }
+        return type_stats[tp]
+
+    for s in ships_ref.values():
+        _ensure_type(s.ship_type.value)['deployed'] += 1
+
     turn = 0
     while turn < max_turns and not server.game_state['game_over']:
         turn += 1
@@ -487,23 +524,31 @@ def simulate(
                     continue
                 transcript.p(f"  {describe_action(ship, action)}")
                 at = action.action_type
+                tp_stats = _ensure_type(ship.ship_type.value)
                 if at == ActionType.SHOOT:
                     tstats['shoot_actions'] += 1
+                    tp_stats['action_shoot'] += 1
                 elif at == ActionType.MOVE:
                     tstats['move_actions'] += 1
+                    tp_stats['action_move'] += 1
                 elif at == ActionType.HEAL:
                     tstats['heal_actions'] += 1
+                    tp_stats['action_heal'] += 1
                 elif at == ActionType.PHASE:
                     tstats['phase_actions'] += 1
+                    tp_stats['action_phase'] += 1
                 elif at == ActionType.HOLOGRAM:
                     tstats['hologram_actions'] += 1
+                    tp_stats['action_hologram'] += 1
                 elif at == ActionType.MINE:
                     tstats['mine_actions'] += 1
+                    tp_stats['action_mine'] += 1
             passed = {s.id for s in ships.values() if s.team == team and s.alive} \
                 - {a.ship_id for a in team_actions}
             for sid in passed:
                 s = ships[sid]
                 transcript.p(f"  [{team.value}] {s.name} → SKIP")
+                _ensure_type(s.ship_type.value)['skip_turns'] += 1
 
         # 4. GM сигналит "end_planning".
         gm.end_planning(server)
@@ -516,12 +561,29 @@ def simulate(
         hits_before = {s.id: s.hits for s in ships.values() if s.alive}
         server.process_turn()
         # После хода: heals = раненые, у которых hits уменьшились.
+        heal_amount_by_team: dict[str, int] = {}
         for sid, before in hits_before.items():
             s = ships.get(sid)
             if s is None or not s.alive:
                 continue
             if s.hits < before:
-                stats[s.team.value]['heals'] += (before - s.hits)
+                delta = before - s.hits
+                stats[s.team.value]['heals'] += delta
+                heal_amount_by_team[s.team.value] = heal_amount_by_team.get(s.team.value, 0) + delta
+                _ensure_type(id_to_type.get(sid, s.ship_type.value))['heals_received'] += delta
+        # heals_given относим к Факелам, которые сходили HEAL в этот ход.
+        for team, team_actions in actions_by_team.items():
+            team_heal = heal_amount_by_team.get(team.value, 0)
+            torches_with_heal = [
+                a for a in team_actions
+                if a.action_type == ActionType.HEAL
+            ]
+            if team_heal and torches_with_heal:
+                per_torch = team_heal / len(torches_with_heal)
+                for a in torches_with_heal:
+                    s = ships.get(a.ship_id)
+                    if s is not None:
+                        _ensure_type(s.ship_type.value)['heals_given'] += per_torch
 
         # 6. Разбираем новые события hit_history и обновляем статы.
         new_events = server.game_state['hit_history'][turn_before_hits:]
@@ -544,6 +606,18 @@ def simulate(
             is_ram = bool(h.get('ram'))
             is_mine = h.get('type') == 'mine_detonated'
             killed = bool(h.get('killed'))
+
+            # Тип атакующего/цели — берём из id→type, fallback на split по имени.
+            def _extract_type(sid: str | None, name: str | None) -> str | None:
+                if sid and sid in id_to_type:
+                    return id_to_type[sid]
+                if name:
+                    return name.split()[0]
+                return None
+
+            atk_type = _extract_type(attacker, h.get('attacker_name'))
+            tgt_type = _extract_type(target, h.get('target_name'))
+
             if is_mine:
                 owner = h.get('owner')
                 if owner and owner in stats:
@@ -551,15 +625,28 @@ def simulate(
                     stats[owner]['damage_dealt'] += damage
                     if killed:
                         stats[owner]['kills'] += 1
-                        tname = h.get('target_name', '').split()[0] if h.get('target_name') else '?'
-                        stats[owner]['kills_by_ship_type'][tname] = \
-                            stats[owner]['kills_by_ship_type'].get(tname, 0) + 1
+                        if tgt_type:
+                            stats[owner]['kills_by_ship_type'][tgt_type] = \
+                                stats[owner]['kills_by_ship_type'].get(tgt_type, 0) + 1
                 if target and target in stats:
-                    tname = h.get('target_name', '').split()[0] if h.get('target_name') else '?'
+                    if killed and tgt_type:
+                        stats[target]['deaths_by_ship_type'][tgt_type] = \
+                            stats[target]['deaths_by_ship_type'].get(tgt_type, 0) + 1
+                # Per-type stats: мина — damage_dealt у Паука (владелец), damage_taken у жертвы.
+                spider_type = ShipType.SPIDER.value
+                sp = _ensure_type(spider_type)
+                sp['mines_dealt'] += 1
+                sp['damage_dealt'] += damage
+                if killed:
+                    sp['kills'] += 1
+                if tgt_type:
+                    tpv = _ensure_type(tgt_type)
+                    tpv['damage_taken'] += damage
+                    tpv['mines_received'] += 1
                     if killed:
-                        stats[target]['deaths_by_ship_type'][tname] = \
-                            stats[target]['deaths_by_ship_type'].get(tname, 0) + 1
+                        tpv['deaths'] += 1
                 continue
+
             if attacker and attacker in stats:
                 if is_ram:
                     stats[attacker]['rams'] += 1
@@ -568,13 +655,32 @@ def simulate(
                 stats[attacker]['damage_dealt'] += damage
                 if killed:
                     stats[attacker]['kills'] += 1
-                    tname = h.get('target_name', '').split()[0] if h.get('target_name') else '?'
-                    stats[attacker]['kills_by_ship_type'][tname] = \
-                        stats[attacker]['kills_by_ship_type'].get(tname, 0) + 1
+                    if tgt_type:
+                        stats[attacker]['kills_by_ship_type'][tgt_type] = \
+                            stats[attacker]['kills_by_ship_type'].get(tgt_type, 0) + 1
             if target and target in stats and killed:
-                tname = h.get('target_name', '').split()[0] if h.get('target_name') else '?'
-                stats[target]['deaths_by_ship_type'][tname] = \
-                    stats[target]['deaths_by_ship_type'].get(tname, 0) + 1
+                if tgt_type:
+                    stats[target]['deaths_by_ship_type'][tgt_type] = \
+                        stats[target]['deaths_by_ship_type'].get(tgt_type, 0) + 1
+
+            # Per-type: damage_dealt / shots_hit / rams_scored / kills для атакующего типа.
+            if atk_type:
+                atk_tp = _ensure_type(atk_type)
+                atk_tp['damage_dealt'] += damage
+                if is_ram:
+                    atk_tp['rams_scored'] += 1
+                else:
+                    atk_tp['shots_hit'] += 1
+                if killed:
+                    atk_tp['kills'] += 1
+            # Per-type: damage_taken / rams_received / deaths для цели.
+            if tgt_type:
+                tgt_tp = _ensure_type(tgt_type)
+                tgt_tp['damage_taken'] += damage
+                if is_ram:
+                    tgt_tp['rams_received'] += 1
+                if killed:
+                    tgt_tp['deaths'] += 1
 
         # Голограммы/мины в state: посчитаем placements.
         for team_value in stats:
@@ -614,9 +720,14 @@ def simulate(
     remaining_hp = {t.value: 0 for t in (Team.TEAM_A, Team.TEAM_B, Team.TEAM_C)}
     for s in ships.values():
         totals[s.team.value] += 1
+        hp_left = s.max_hits - s.hits if s.alive else 0
         if s.alive:
             survivors[s.team.value] += 1
-            remaining_hp[s.team.value] += (s.max_hits - s.hits)
+            remaining_hp[s.team.value] += hp_left
+        tp = _ensure_type(s.ship_type.value)
+        if s.alive:
+            tp['survivor_hp_sum'] += hp_left
+            tp['survivor_hp_max_sum'] += s.max_hits
 
     transcript.h("Сводка по командам")
     for team in (Team.TEAM_A, Team.TEAM_B, Team.TEAM_C):
@@ -666,6 +777,7 @@ def simulate(
         'totals': totals,
         'remaining_hp': remaining_hp,
         'stats': stats,
+        'type_stats': type_stats,
         'total_damage': total_damage,
         'avg_damage_per_turn': round(total_damage / turn, 2) if turn else 0,
         'log_path': out_path,
