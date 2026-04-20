@@ -143,6 +143,10 @@ class Ship:
             'hits': self.hits,
             'max_hits': self.max_hits,
             'can_shoot': self.can_shoot,
+            'move_range': self.move_range,
+            'shoot_range': self.shoot_range,
+            'shoot_anywhere': getattr(self, 'shoot_anywhere', False),
+            'scan_whole_z': getattr(self, 'scan_whole_z', False),
             'ship_type': self.ship_type.value,
         }
 

@@ -20,6 +20,7 @@ callers can poll with a short timeout without losing data mid-message.
 import json
 import socket
 import struct
+import threading
 import time
 
 HEADER = struct.Struct(">I")
@@ -37,13 +38,18 @@ class Framed:
         self.sock = sock
         self._buf = bytearray()
         self._closed = False
+        # sendall() с разных потоков на одном и том же сокете может перемешать
+        # байты и сломать фрейминг. Сериализуем send'ы одним локом.
+        self._send_lock = threading.Lock()
 
     def send(self, obj) -> None:
         """Serialize obj to JSON and send as a single framed message."""
         if self._closed:
             raise ProtocolError("socket is closed")
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self.sock.sendall(HEADER.pack(len(data)) + data)
+        frame = HEADER.pack(len(data)) + data
+        with self._send_lock:
+            self.sock.sendall(frame)
 
     def recv_once(self, timeout=None):
         """
@@ -73,6 +79,16 @@ class Framed:
                 data = self.sock.recv(65536)
             except socket.timeout:
                 return self._try_extract()
+            except ConnectionError as e:
+                # Отдельно ловим ConnectionResetError / ConnectionAbortedError:
+                # это форсированный разрыв со стороны пира. Без этого сервер
+                # продолжал бы до 60с дёргать мёртвое соединение и не
+                # выкидывал игрока из self.clients.
+                self._closed = True
+                raise ProtocolError(f"connection lost: {e}") from e
+            except OSError as e:
+                self._closed = True
+                raise ProtocolError(f"socket error: {e}") from e
 
             if not data:
                 self._closed = True

@@ -8,19 +8,27 @@ from shared_simple import *
 from protocol import Framed, ProtocolError
 
 class MapWindow:
-    def __init__(self, parent, team_name, team_color):
+    def __init__(self, parent, team_name, team_color, gui=None):
         self.parent = parent
+        # Ссылка на GameClientGUI — нужна, чтобы обрабатывать клики по карте
+        # (пробрасывание координат в форму планирования).
+        self.gui = gui
         self.team_name = team_name
         self.team_color = team_color
         self.window = Toplevel(parent)
         self.window.title(f"🗺️ Карта - {team_name}")
         self.window.geometry("900x700")
         self.window.configure(bg='#0a0e27')
-        
+
         # Переменные
         self.current_layer = IntVar(value=0)
         self.ships_data = {}
         self.enemies_data = {}
+        # Подсветка легальных клеток и выбранной цели — задаётся родителем
+        # (GameClientGUI) через set_targeting() во время планирования действий.
+        self._legal_cells = set()       # множество (x, y, z)
+        self._selected_target = None    # (x, y, z) или None
+        self._targeting_mode = None     # "move" / "shoot" / None (цвет)
         
         # Цветовая схема
         self.colors = {
@@ -87,7 +95,7 @@ class MapWindow:
         self.map_frame = Frame(map_container, bg=self.colors['bg2'])
         self.map_frame.pack(expand=True)
         
-        # Создаем сетку 10x10
+        # Создаем сетку 10x10. row = y, col = x (см. update_map и отрисовку).
         self.cells = []
         for row in range(10):
             row_cells = []
@@ -97,6 +105,11 @@ class MapWindow:
                            font=('Arial', 10, 'bold'),
                            bg=self.colors['bg2'], fg='white')
                 cell.grid(row=row, column=col, padx=2, pady=2)
+                # Клик по клетке: колонка = x, строка = y, z = текущий слой.
+                cell.bind(
+                    "<Button-1>",
+                    lambda _e, x=col, y=row: self._on_cell_click(x, y),
+                )
                 row_cells.append(cell)
             self.cells.append(row_cells)
         
@@ -183,11 +196,18 @@ class MapWindow:
         """Обновляет отображение карты для текущего слоя"""
         layer = self.current_layer.get()
         self.layer_label.config(text=f"Z = {layer}")
-        
-        # Очищаем карту
+
+        # Очищаем карту (в т.ч. рамки от прошлой подсветки).
         for row in range(10):
             for col in range(10):
-                self.cells[row][col].config(text=" ", bg=self.colors['bg2'], fg="white")
+                self.cells[row][col].config(
+                    text=" ",
+                    bg=self.colors['bg2'],
+                    fg="white",
+                    highlightthickness=0,
+                    borderwidth=2,
+                    relief=RAISED,
+                )
         
         # Отображаем свои корабли
         your_ships_count = 0
@@ -261,13 +281,63 @@ class MapWindow:
                 )
                 enemy_ships_count += 1
         
+        # Поверх кораблей — рамка для легальных клеток (подсветка хода /
+        # линии огня) и для уже выбранной цели. Это позволяет игроку видеть,
+        # куда корабль может пойти или куда можно выстрелить.
+        if self._legal_cells:
+            legal_color = (
+                '#ffd700' if self._targeting_mode == 'shoot'
+                else '#6bff6b'
+            )
+            for (lx, ly, lz) in self._legal_cells:
+                if lz == layer and 0 <= lx < 10 and 0 <= ly < 10:
+                    self.cells[ly][lx].config(
+                        highlightthickness=3,
+                        highlightbackground=legal_color,
+                        highlightcolor=legal_color,
+                    )
+        if self._selected_target is not None:
+            sx, sy, sz = self._selected_target
+            if sz == layer and 0 <= sx < 10 and 0 <= sy < 10:
+                self.cells[sy][sx].config(
+                    highlightthickness=4,
+                    highlightbackground='#ffffff',
+                    highlightcolor='#ffffff',
+                )
+
         # Обновляем статус
         status_text = f"📍 Слой Z={layer} | 🚀 Ваших: {your_ships_count} | 🎯 Врагов: {enemy_ships_count}"
         if radio_ships_on_layer:
             status_text += " | 📡 Радиовышка сканирует слой!"
-        
+        if self._targeting_mode == 'move':
+            status_text += "  |  🚀 Выберите клетку для хода"
+        elif self._targeting_mode == 'shoot':
+            status_text += "  |  🎯 Выберите клетку для выстрела"
+
         self.status_label.config(text=status_text)
-    
+
+    def _on_cell_click(self, x, y):
+        """Клик по клетке. Пробрасывается в GUI родителя, если задан."""
+        if self.gui is None:
+            return
+        self.gui.on_map_click(x, y, self.current_layer.get())
+
+    def set_targeting(self, legal_cells=None, selected=None, mode=None):
+        """Установить подсветку легальных клеток/выбранной цели."""
+        self._legal_cells = set(legal_cells) if legal_cells else set()
+        self._selected_target = selected
+        self._targeting_mode = mode
+        # Если выбранная цель на другом слое — прыгнем туда, чтобы её видеть.
+        if selected is not None:
+            _, _, sz = selected
+            if int(self.current_layer.get()) != sz:
+                self.current_layer.set(sz)
+                return  # trace вызовет update_map сам
+        self.update_map()
+
+    def clear_targeting(self):
+        self.set_targeting(None, None, None)
+
     def update_data(self, ships_data, enemies_data):
         """Обновляет данные кораблей"""
         self.ships_data = ships_data
@@ -311,7 +381,14 @@ class GameClientGUI:
         # Переменные
         self.actions = []
         self.map_window = None
-        
+        self.team_color = '#00d4ff'  # будет переопределено при подключении
+        # Состояние «выбора цели на карте»: когда игрок в планировщике
+        # нажимает «Выбрать на карте», сюда кладётся словарь с контекстом,
+        # а кликом по карте координаты записываются в нужные StringVar'ы.
+        #   {'ship': <dict>, 'kind': 'move'|'shoot',
+        #    'vars': (x_var, y_var, z_var), 'legal': set((x,y,z),...)}
+        self.target_capture = None
+
         # Создаем интерфейс
         self.create_widgets()
         
@@ -347,6 +424,13 @@ class GameClientGUI:
                                   bg=self.colors['panel'], fg='red',
                                   font=('Arial', 10, 'bold'))
         self.status_label.pack(side=LEFT, padx=10)
+
+        # Визуальный таймер фазы планирования (обновляется каждые 0.5с).
+        self.timer_label = Label(
+            status_bar, text="", bg=self.colors['panel'],
+            fg=self.colors['accent4'], font=('Arial', 11, 'bold'),
+        )
+        self.timer_label.pack(side=RIGHT, padx=10)
         
         # Панель информации
         self.create_info_panel()
@@ -356,6 +440,9 @@ class GameClientGUI:
         
         # Панель врагов
         self.create_enemies_panel()
+
+        # Журнал попаданий за всю партию.
+        self.create_history_panel()
         
         # Нижняя панель с кнопками
         self.create_button_panel()
@@ -494,6 +581,55 @@ class GameClientGUI:
         self.enemies_tree.pack(side=LEFT, fill=BOTH, expand=True)
         scrollbar.pack(side=RIGHT, fill=Y)
     
+    def create_history_panel(self):
+        """Журнал попаданий за всю партию (cumulative)."""
+        hist_frame = LabelFrame(
+            self.root, text="📜 ЖУРНАЛ ПОПАДАНИЙ",
+            bg=self.colors['panel'], fg=self.colors['accent4'],
+            font=('Arial', 11, 'bold'),
+        )
+        hist_frame.pack(fill=BOTH, expand=False, padx=10, pady=5)
+
+        inner = Frame(hist_frame, bg=self.colors['panel'])
+        inner.pack(fill=BOTH, expand=True, padx=10, pady=5)
+
+        self.history_text = Text(
+            inner, height=6, bg=self.colors['bg2'], fg='white',
+            font=('Consolas', 9), wrap=NONE, state=DISABLED,
+        )
+        self.history_text.pack(side=LEFT, fill=BOTH, expand=True)
+
+        sb = ttk.Scrollbar(inner, orient=VERTICAL, command=self.history_text.yview)
+        self.history_text.configure(yscrollcommand=sb.set)
+        sb.pack(side=RIGHT, fill=Y)
+
+    def update_history(self, history):
+        """Обновляет журнал попаданий."""
+        if not hasattr(self, 'history_text'):
+            return
+        self.history_text.config(state=NORMAL)
+        self.history_text.delete(1.0, END)
+        if not history:
+            self.history_text.insert(END, "Попаданий ещё не было\n")
+        else:
+            self.history_text.insert(END, f"Всего событий: {len(history)}\n\n")
+            for hit in history:
+                turn = hit.get('turn', '?')
+                attacker = hit.get('attacker', '?')
+                attacker_name = hit.get('attacker_name', '')
+                target = hit.get('target', '?')
+                target_name = hit.get('target_name', '')
+                position = hit.get('position', '?')
+                killed = hit.get('killed', False)
+                marker = "💀" if killed else "🎯"
+                self.history_text.insert(
+                    END,
+                    f"T{turn:>2}: {marker} {attacker} {attacker_name} → "
+                    f"{target} {target_name} @ {position}\n",
+                )
+        self.history_text.see(END)
+        self.history_text.config(state=DISABLED)
+
     def create_button_panel(self):
         """Панель с кнопками управления"""
         button_frame = Frame(self.root, bg=self.colors['panel'], height=60)
@@ -808,6 +944,12 @@ class GameClientGUI:
                 state.get('my_ships', {}),
                 state.get('visible_enemies', {})
             )
+
+        # Журнал попаданий (cumulative за всю партию).
+        self.update_history(state.get('hit_history', []))
+
+        # Визуальный таймер фазы планирования — приходит через poll_timer().
+        self._render_timer_from_state(state)
     
     def update_ships_list(self, state):
         """Обновляет список своих кораблей"""
@@ -876,6 +1018,128 @@ class GameClientGUI:
                 "---"
             ))
     
+    def _render_timer_from_state(self, state):
+        """Форматирует текст таймера из state (deadline + counts)."""
+        if state is None:
+            self.timer_label.config(text="")
+            return
+        phase = state.get('phase')
+        if phase != 'planning':
+            self.timer_label.config(text="")
+            return
+        deadline = state.get('planning_deadline')
+        if not deadline:
+            self.timer_label.config(text="")
+            return
+        remaining = max(0, int(deadline - time.time()))
+        self.timer_label.config(
+            text=f"⏱ {remaining}с до конца фазы планирования",
+            fg=(self.colors['accent2'] if remaining <= 10 else self.colors['accent4']),
+        )
+
+    def poll_timer(self):
+        """Каждые 0.5с пересчитывает таймер из current_state."""
+        try:
+            self._render_timer_from_state(self.current_state)
+        finally:
+            self.root.after(500, self.poll_timer)
+
+    # --- Клик по карте → запись координат в форму планирования ------------
+
+    def _legal_cells_for(self, ship, kind):
+        """Возвращает множество (x,y,z) легальных клеток для хода или
+        выстрела конкретного корабля по его типу/диапазону."""
+        cells = set()
+        sx, sy, sz = ship['x'], ship['y'], ship['z']
+        if kind == 'move':
+            mr = ship.get('move_range', 1)
+            if mr <= 0:
+                return cells
+            for dx in range(-mr, mr + 1):
+                for dy in range(-mr, mr + 1):
+                    for dz in range(-mr, mr + 1):
+                        if dx == 0 and dy == 0 and dz == 0:
+                            continue
+                        nx, ny, nz = sx + dx, sy + dy, sz + dz
+                        if 0 <= nx < 10 and 0 <= ny < 10 and 0 <= nz < 10:
+                            cells.add((nx, ny, nz))
+            return cells
+        if kind == 'shoot':
+            sr = ship.get('shoot_range', 0)
+            if sr <= 0:
+                return cells
+            if ship.get('shoot_anywhere'):
+                # Артиллерия: любая клетка куба в пределах sr по каждой оси.
+                for x in range(10):
+                    for y in range(10):
+                        for z in range(10):
+                            if (abs(x - sx) <= sr and abs(y - sy) <= sr
+                                    and abs(z - sz) <= sr):
+                                cells.add((x, y, z))
+                return cells
+            # Обычные: стрельба по прямой вдоль одной оси (остальные оси
+            # совпадают с позицией корабля), дистанция >= 1 и <= shoot_range.
+            for d in range(1, sr + 1):
+                for (dx, dy, dz) in (
+                    (d, 0, 0), (-d, 0, 0),
+                    (0, d, 0), (0, -d, 0),
+                    (0, 0, d), (0, 0, -d),
+                ):
+                    nx, ny, nz = sx + dx, sy + dy, sz + dz
+                    if 0 <= nx < 10 and 0 <= ny < 10 and 0 <= nz < 10:
+                        cells.add((nx, ny, nz))
+            return cells
+        return cells
+
+    def start_target_capture(self, ship, kind, vars_tuple, status_label=None):
+        """Активирует режим выбора цели на карте для данного корабля.
+
+        Открывает окно карты, подсвечивает легальные клетки. Клик по клетке
+        попадёт в on_map_click и запишет координаты в vars_tuple.
+        """
+        legal = self._legal_cells_for(ship, kind)
+        self.target_capture = {
+            'ship': ship,
+            'kind': kind,
+            'vars': vars_tuple,
+            'legal': legal,
+            'status_label': status_label,
+        }
+        self.show_map()
+        if self.map_window:
+            self.map_window.set_targeting(legal_cells=legal, mode=kind)
+            # Переключимся на Z корабля для удобства.
+            self.map_window.current_layer.set(ship['z'])
+        if status_label is not None:
+            status_label.config(text="👉 Кликните по карте, чтобы выбрать цель")
+
+    def on_map_click(self, x, y, z):
+        """Обработчик клика по клетке карты в режиме выбора цели."""
+        cap = self.target_capture
+        if cap is None:
+            return
+        if (x, y, z) not in cap['legal']:
+            if self.map_window:
+                self.map_window.set_targeting(
+                    legal_cells=cap['legal'], selected=None, mode=cap['kind']
+                )
+            messagebox.showinfo(
+                "Недоступная клетка",
+                "Эта клетка недоступна для выбранного действия.\n"
+                "Подсвеченные рамкой клетки — легальные.",
+            )
+            return
+        x_var, y_var, z_var = cap['vars']
+        x_var.set(str(x)); y_var.set(str(y)); z_var.set(str(z))
+        if self.map_window:
+            self.map_window.set_targeting(
+                legal_cells=cap['legal'], selected=(x, y, z), mode=cap['kind']
+            )
+        status_label = cap.get('status_label')
+        if status_label is not None:
+            status_label.config(text=f"✅ Выбрано: ({x}, {y}, {z})")
+        self.target_capture = None
+
     def show_map(self):
         """Показывает окно с картой"""
         if not self.current_state:
@@ -886,7 +1150,9 @@ class GameClientGUI:
             self.map_window.window.lift()
             self.map_window.window.focus()
         else:
-            self.map_window = MapWindow(self.root, self.team.value, self.team_color)
+            self.map_window = MapWindow(
+                self.root, self.team.value, self.team_color, gui=self
+            )
             self.map_window.update_data(
                 self.current_state.get('my_ships', {}),
                 self.current_state.get('visible_enemies', {})
@@ -1022,6 +1288,20 @@ class GameClientGUI:
                 Entry(coord_frame, textvariable=move_z_var, width=3,
                       bg=self.colors['bg2'], fg='white',
                       insertbackground='white').pack(side=LEFT, padx=1)
+
+                move_status = Label(
+                    move_frame, text="", bg=self.colors['panel'],
+                    fg=self.colors['accent3'], font=('Arial', 9),
+                )
+                move_status.pack(side=LEFT, padx=8)
+                Button(
+                    move_frame, text="🗺 Выбрать на карте",
+                    bg=self.colors['accent1'], fg='black',
+                    font=('Arial', 9, 'bold'),
+                    command=lambda s=ship, mv=(move_x_var, move_y_var, move_z_var),
+                                   lbl=move_status:
+                        self.start_target_capture(s, 'move', mv, lbl),
+                ).pack(side=LEFT, padx=5)
             else:
                 Label(ship_frame, text="⚠️ Артиллерия не может двигаться",
                      bg=self.colors['panel'], fg='orange',
@@ -1057,6 +1337,20 @@ class GameClientGUI:
                 Entry(coord_frame, textvariable=shoot_z_var, width=3,
                       bg=self.colors['bg2'], fg='white',
                       insertbackground='white').pack(side=LEFT, padx=1)
+
+                shoot_status = Label(
+                    shoot_frame, text="", bg=self.colors['panel'],
+                    fg=self.colors['accent4'], font=('Arial', 9),
+                )
+                shoot_status.pack(side=LEFT, padx=8)
+                Button(
+                    shoot_frame, text="🗺 Выбрать на карте",
+                    bg=self.colors['accent1'], fg='black',
+                    font=('Arial', 9, 'bold'),
+                    command=lambda s=ship, sv=(shoot_x_var, shoot_y_var, shoot_z_var),
+                                   lbl=shoot_status:
+                        self.start_target_capture(s, 'shoot', sv, lbl),
+                ).pack(side=LEFT, padx=5)
             else:
                 Label(ship_frame, text="📡 Радиовышка не может стрелять",
                      bg=self.colors['panel'], fg='#00d4ff',
@@ -1268,6 +1562,7 @@ class GameClientGUI:
             self.update_interface(self.current_state)
     
     def run(self):
+        self.root.after(500, self.poll_timer)
         """Запускает приложение"""
         self.root.mainloop()
 

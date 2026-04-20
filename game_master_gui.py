@@ -88,6 +88,7 @@ class GameMasterGUI:
         # Создаем панели
         self.create_map_panel(left_panel)
         self.create_info_panel(right_panel)
+        self.create_control_panel(right_panel)
         self.create_hits_panel(right_panel)
         self.create_stats_panel(right_panel)
         self.create_legend_panel(right_panel)
@@ -181,6 +182,60 @@ class GameMasterGUI:
                                        fg=self.colors['accent3'], font=('Arial', 12, 'bold'))
         self.game_status_label.grid(row=2, column=1, sticky=W, padx=10, pady=5)
     
+    def create_control_panel(self, parent):
+        """Панель управления ходом (start / end / stop / override)."""
+        frame = LabelFrame(parent, text="🎛️ УПРАВЛЕНИЕ ХОДОМ",
+                           bg=self.colors['panel'], fg=self.colors['accent1'],
+                           font=('Arial', 12, 'bold'))
+        frame.pack(fill=X, pady=(0, 10))
+
+        inner = Frame(frame, bg=self.colors['panel'])
+        inner.pack(fill=X, padx=10, pady=10)
+
+        self.timer_label = Label(
+            inner,
+            text="⏱ ожидание…",
+            bg=self.colors['panel'],
+            fg=self.colors['accent4'],
+            font=('Arial', 11, 'bold'),
+        )
+        self.timer_label.grid(row=0, column=0, columnspan=3, sticky=W, pady=(0, 8))
+
+        self.btn_start = Button(
+            inner, text="▶ Начать ход",
+            bg='#228B22', fg='white', font=('Arial', 10, 'bold'),
+            command=lambda: self.send_gm_command('start_turn'),
+            state=DISABLED,
+        )
+        self.btn_start.grid(row=1, column=0, sticky=EW, padx=2, pady=2)
+
+        self.btn_end = Button(
+            inner, text="⏹ Завершить сбор",
+            bg='#b8860b', fg='white', font=('Arial', 10, 'bold'),
+            command=lambda: self.send_gm_command('end_planning'),
+            state=DISABLED,
+        )
+        self.btn_end.grid(row=1, column=1, sticky=EW, padx=2, pady=2)
+
+        self.btn_stop = Button(
+            inner, text="🛑 Стоп",
+            bg='#8b0000', fg='white', font=('Arial', 10, 'bold'),
+            command=lambda: self.send_gm_command('stop'),
+            state=DISABLED,
+        )
+        self.btn_stop.grid(row=1, column=2, sticky=EW, padx=2, pady=2)
+
+        self.btn_override = Button(
+            inner, text="🛠 Override позиции корабля",
+            bg=self.colors['accent1'], fg='black', font=('Arial', 10, 'bold'),
+            command=self.open_override_dialog,
+            state=DISABLED,
+        )
+        self.btn_override.grid(row=2, column=0, columnspan=3, sticky=EW, padx=2, pady=(6, 2))
+
+        for col in range(3):
+            inner.grid_columnconfigure(col, weight=1, uniform='gm_btn')
+
     def create_hits_panel(self, parent):
         """Панель с попаданиями"""
         hits_frame = LabelFrame(parent, text="💥 ПОПАДАНИЯ В ПОСЛЕДНЕМ ХОДУ",
@@ -438,17 +493,19 @@ class GameMasterGUI:
         phase = state.get('phase', 'unknown')
         message = state.get('message', '')
         game_over = state.get('game_over', False)
-        
+
         # Обновляем информацию
         self.turn_label.config(text=str(turn))
-        
+
         if phase == 'planning':
             self.phase_label.config(text="📝 ПЛАНИРОВАНИЕ", fg=self.colors['accent3'])
         elif phase == 'results':
             self.phase_label.config(text="📊 РЕЗУЛЬТАТЫ", fg='orange')
+        elif phase == 'waiting_for_gm':
+            self.phase_label.config(text="⏳ ЖДЁТ GM", fg=self.colors['accent4'])
         else:
             self.phase_label.config(text=phase.upper(), fg='gray')
-        
+
         if game_over:
             winner = state.get('winner', 'Не определен')
             self.game_status_label.config(text=f"Окончена. Победитель: {winner}", fg='red')
@@ -456,13 +513,41 @@ class GameMasterGUI:
         else:
             self.game_status_label.config(text="Идет", fg=self.colors['accent3'])
             self.message_label.config(text=message, fg='white')
-        
+
+        # Статус кнопок управления: зависит от фазы.
+        can_start = (phase == 'waiting_for_gm') and not game_over
+        can_end = (phase == 'planning') and not game_over
+        can_stop = not game_over
+        can_override = not game_over
+        self.btn_start.config(state=(NORMAL if can_start else DISABLED))
+        self.btn_end.config(state=(NORMAL if can_end else DISABLED))
+        self.btn_stop.config(state=(NORMAL if can_stop else DISABLED))
+        self.btn_override.config(state=(NORMAL if can_override else DISABLED))
+
+        # Таймер фазы планирования.
+        deadline = state.get('planning_deadline')
+        if phase == 'planning' and deadline:
+            remaining = max(0, int(deadline - time.time()))
+            received = state.get('actions_received_teams', [])
+            connected = state.get('connected_teams', [])
+            self.timer_label.config(
+                text=f"⏱ {remaining}с  |  действия: {len(received)}/{len(connected)}"
+            )
+        elif phase == 'waiting_for_gm':
+            self.timer_label.config(text="⏸ ждём старта — нажмите «Начать ход»")
+        elif phase == 'results':
+            self.timer_label.config(text="📊 результаты хода")
+        elif game_over:
+            self.timer_label.config(text="🏁 игра окончена")
+        else:
+            self.timer_label.config(text="⏱ ожидание…")
+
         # Обновляем статистику команд
         self.update_stats(state)
-        
+
         # Обновляем информацию о попаданиях
         self.update_hits_info(state)
-        
+
         # Обновляем карту
         self.update_map()
     
@@ -517,26 +602,160 @@ class GameMasterGUI:
         ), tags=('team_c',))
     
     def update_hits_info(self, state):
-        """Обновляет информацию о попаданиях"""
+        """Перерисовывает журнал всех попаданий партии (scrollable)."""
         self.hits_text.delete(1.0, END)
-        
-        last_hits = state.get('last_hits', [])
-        
-        if not last_hits:
-            self.hits_text.insert(END, "В последнем ходу попаданий не было\n", 'info')
-        else:
-            self.hits_text.insert(END, f"💥 ПОПАДАНИЯ В ХОДУ {state.get('turn', 0) + 1}:\n\n", 'info')
-            for hit in last_hits:
-                attacker = hit.get('attacker', 'Неизвестно')
-                attacker_name = hit.get('attacker_name', 'Неизвестно')
-                target = hit.get('target', 'Неизвестно')
-                target_name = hit.get('target_name', 'Неизвестно')
-                position = hit.get('position', 'Неизвестно')
-                
-                self.hits_text.insert(END, f"🎯 {attacker}: {attacker_name}\n", 'hit')
-                self.hits_text.insert(END, f"   → {target}: {target_name}\n", 'hit')
-                self.hits_text.insert(END, f"   📍 Позиция: {position}\n", 'hit')
-                self.hits_text.insert(END, "-" * 30 + "\n", 'info')
+
+        history = state.get('hit_history', [])
+        if not history:
+            self.hits_text.insert(END, "Попаданий ещё не было\n", 'info')
+            return
+
+        self.hits_text.insert(END, f"💥 ЖУРНАЛ ПОПАДАНИЙ ({len(history)}):\n\n", 'info')
+        for hit in history:
+            turn = hit.get('turn', '?')
+            attacker = hit.get('attacker', '?')
+            attacker_name = hit.get('attacker_name', '?')
+            target = hit.get('target', '?')
+            target_name = hit.get('target_name', '?')
+            position = hit.get('position', '?')
+            killed = hit.get('killed', False)
+            marker = "💀" if killed else "🎯"
+            self.hits_text.insert(
+                END,
+                f"T{turn:>2}: {marker} {attacker} {attacker_name} → "
+                f"{target} {target_name} @ {position}\n",
+                'hit',
+            )
+        self.hits_text.see(END)
+
+    # ─────────────────────────── GM commands ──────────────────────────
+    def send_gm_command(self, command, **payload):
+        """Отправить gm_command серверу. Тихо логирует ошибки в status_bar."""
+        if not self.connected or self.framed is None:
+            messagebox.showwarning("Нет соединения", "Не подключен к серверу")
+            return False
+        msg = {'type': 'gm_command', 'command': command}
+        msg.update(payload)
+        try:
+            self.framed.send(msg)
+        except ProtocolError as e:
+            messagebox.showerror("Ошибка", f"Не удалось отправить: {e}")
+            self.connected = False
+            return False
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось отправить: {e}")
+            return False
+        return True
+
+    def open_override_dialog(self):
+        """Диалог принудительного изменения позиции/состояния корабля (арбитраж)."""
+        if not self.current_state:
+            messagebox.showinfo("Нет данных", "Данные о кораблях ещё не получены")
+            return
+        all_ships = self.current_state.get('all_ships', {})
+        if not all_ships:
+            messagebox.showinfo("Нет кораблей", "На карте нет кораблей")
+            return
+
+        dlg = Toplevel(self.root)
+        dlg.title("🛠 Override корабля")
+        dlg.configure(bg=self.colors['bg'])
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.geometry("420x380")
+
+        Label(dlg, text="🛠 РУЧНОЕ ИЗМЕНЕНИЕ ПОЗИЦИИ",
+              bg=self.colors['bg'], fg=self.colors['accent4'],
+              font=('Arial', 13, 'bold')).pack(pady=10)
+
+        form = Frame(dlg, bg=self.colors['panel'], bd=2, relief=RAISED)
+        form.pack(padx=20, pady=10, fill=BOTH, expand=True)
+
+        # Корабль
+        Label(form, text="Корабль:", bg=self.colors['panel'], fg='white',
+              font=('Arial', 10, 'bold')).grid(row=0, column=0, sticky=W, padx=10, pady=6)
+        ship_options = []
+        for sid, s in sorted(all_ships.items()):
+            label = (f"{sid}  [{s.get('team','?')}]  {s.get('name','')}  "
+                     f"({s.get('x','?')},{s.get('y','?')},{s.get('z','?')})  "
+                     f"{'alive' if s.get('alive') else 'DEAD'} "
+                     f"hits={s.get('hits',0)}")
+            ship_options.append((sid, label, s))
+
+        id_var = StringVar(value=ship_options[0][1])
+        ship_menu = ttk.Combobox(form, textvariable=id_var,
+                                 values=[lbl for (_, lbl, _) in ship_options],
+                                 state='readonly', width=48)
+        ship_menu.grid(row=0, column=1, columnspan=3, sticky=EW, padx=10, pady=6)
+
+        # X / Y / Z
+        def _coord_row(label, r, default):
+            Label(form, text=label, bg=self.colors['panel'], fg='white',
+                  font=('Arial', 10, 'bold')).grid(row=r, column=0, sticky=W, padx=10, pady=6)
+            sv = IntVar(value=default)
+            Spinbox(form, from_=0, to=9, textvariable=sv, width=6,
+                    font=('Arial', 10)).grid(row=r, column=1, sticky=W, padx=10, pady=6)
+            return sv
+
+        first_ship = ship_options[0][2]
+        x_var = _coord_row("X (0–9):", 1, int(first_ship.get('x', 0)))
+        y_var = _coord_row("Y (0–9):", 2, int(first_ship.get('y', 0)))
+        z_var = _coord_row("Z (0–9):", 3, int(first_ship.get('z', 0)))
+
+        # alive / hits
+        alive_var = BooleanVar(value=bool(first_ship.get('alive', True)))
+        Checkbutton(form, text="Жив", variable=alive_var,
+                    bg=self.colors['panel'], fg='white',
+                    selectcolor=self.colors['bg2'],
+                    activebackground=self.colors['panel'],
+                    font=('Arial', 10, 'bold')
+                    ).grid(row=4, column=0, sticky=W, padx=10, pady=6)
+
+        Label(form, text="Попаданий:", bg=self.colors['panel'], fg='white',
+              font=('Arial', 10, 'bold')).grid(row=4, column=1, sticky=E, padx=5, pady=6)
+        hits_var = IntVar(value=int(first_ship.get('hits', 0)))
+        Spinbox(form, from_=0, to=10, textvariable=hits_var, width=6,
+                font=('Arial', 10)).grid(row=4, column=2, sticky=W, pady=6)
+
+        # Обновляем поля при смене корабля.
+        def _on_ship_selected(*_):
+            idx = ship_menu.current()
+            if idx < 0:
+                return
+            sid, _label, s = ship_options[idx]
+            x_var.set(int(s.get('x', 0)))
+            y_var.set(int(s.get('y', 0)))
+            z_var.set(int(s.get('z', 0)))
+            alive_var.set(bool(s.get('alive', True)))
+            hits_var.set(int(s.get('hits', 0)))
+        ship_menu.bind("<<ComboboxSelected>>", _on_ship_selected)
+
+        # Кнопки
+        btns = Frame(dlg, bg=self.colors['bg'])
+        btns.pack(pady=10)
+
+        def _apply():
+            idx = ship_menu.current()
+            if idx < 0:
+                return
+            sid = ship_options[idx][0]
+            ok = self.send_gm_command(
+                'override_ship',
+                ship_id=sid,
+                x=int(x_var.get()),
+                y=int(y_var.get()),
+                z=int(z_var.get()),
+                alive=bool(alive_var.get()),
+                hits=int(hits_var.get()),
+            )
+            if ok:
+                dlg.destroy()
+
+        Button(btns, text="✅ Применить", bg=self.colors['accent3'], fg='black',
+               font=('Arial', 10, 'bold'), width=15, command=_apply).pack(side=LEFT, padx=10)
+        Button(btns, text="Отмена", bg=self.colors['accent2'], fg='white',
+               font=('Arial', 10, 'bold'), width=10,
+               command=dlg.destroy).pack(side=LEFT, padx=10)
     
     def update_map(self, *args):
         """Обновляет отображение карты для текущего слоя"""
@@ -599,8 +818,27 @@ class GameMasterGUI:
                     font=('Arial', 10, 'bold')
                 )
     
+    def tick_timer(self):
+        """Каждую секунду пересчитывает таймер из current_state, даже если от
+        сервера нет нового пуша."""
+        try:
+            state = self.current_state
+            if state is not None and state.get('phase') == 'planning':
+                deadline = state.get('planning_deadline')
+                if deadline:
+                    remaining = max(0, int(deadline - time.time()))
+                    received = state.get('actions_received_teams', [])
+                    connected = state.get('connected_teams', [])
+                    self.timer_label.config(
+                        text=f"⏱ {remaining}с  |  действия: "
+                             f"{len(received)}/{len(connected)}"
+                    )
+        finally:
+            self.root.after(500, self.tick_timer)
+
     def run(self):
         """Запускает приложение"""
+        self.root.after(500, self.tick_timer)
         self.root.mainloop()
 
 if __name__ == "__main__":

@@ -582,6 +582,23 @@ class GameServer:
         self.game_master_framed = None
         self.game_master_thread = None
 
+        # Сигналы от гейммастера для управления ходом.
+        # start_event  — начать очередную фазу планирования (и первую, и все следующие).
+        # end_event    — завершить текущую фазу планирования досрочно.
+        # stop_event   — прекратить игру.
+        self.gm_start_event = threading.Event()
+        self.gm_end_planning_event = threading.Event()
+        self.gm_stop_event = threading.Event()
+
+        # Длительность фазы планирования в секундах. GM может это поменять.
+        self.planning_timeout = 60
+        # Время, когда истечёт текущая фаза планирования (epoch seconds),
+        # None если сейчас не фаза сбора действий.
+        self.planning_deadline = None
+
+        # История попаданий за всю партию — для показа в клиентах.
+        self.game_state['hit_history'] = []
+
         # Создаем корабли
         self.create_ships()
     
@@ -758,10 +775,8 @@ class GameServer:
                 # Отправляем полную карту гейммастеру
                 self.send_full_state_to_game_master()
 
-                # Держим поток живым, пока идёт игра; без busy-wait не обойтись,
-                # потому что обработка ходов ведётся из main_loop сервера.
-                while self.running and not self.game_state['game_over']:
-                    time.sleep(0.5)
+                # Читаем управляющие команды от GM и диспатчим их.
+                self._game_master_loop(framed)
                 return
 
             # Подключение игрока
@@ -832,6 +847,9 @@ class GameServer:
                     'winner': self.game_state['winner'],
                     'game_mode': self.game_state['game_mode'],
                     'last_hits': self.game_state['last_hits'],
+                    'hit_history': self.game_state['hit_history'],
+                    'planning_deadline': self.planning_deadline,
+                    'planning_timeout': self.planning_timeout,
                 }
             framed.send(state)
         except Exception as e:
@@ -844,6 +862,101 @@ class GameServer:
         self.client_threads.pop(team, None)
         if framed is not None:
             framed.close()
+
+    def _game_master_loop(self, framed):
+        """Поток, обслуживающий единственного GM. Ждёт сообщений типа
+        ``{'type':'gm_command', 'command': ..., ...}`` и диспатчит их.
+
+        Поддерживаемые команды:
+          - ``start_turn``: разрешить main_loop начать очередную фазу планирования.
+          - ``end_planning``: досрочно завершить сбор действий у игроков.
+          - ``stop``: завершить игру.
+          - ``set_timeout`` (seconds): поменять таймаут фазы планирования.
+          - ``override_ship`` (ship_id, x, y, z, alive?): вручную поменять
+            положение/состояние корабля (арбитраж GM).
+        """
+        while self.running and not self.game_state['game_over']:
+            try:
+                msg = framed.recv_once(timeout=0.5)
+            except ProtocolError as e:
+                self.log(f"❌ GM разорвал связь: {e}", 'error')
+                self.game_master_framed = None
+                self.gm_stop_event.set()
+                return
+            except Exception as e:
+                self.log(f"❌ Ошибка от GM: {e}", 'error')
+                continue
+
+            if msg is None:
+                continue
+            if not isinstance(msg, dict) or msg.get('type') != 'gm_command':
+                continue
+
+            self.handle_gm_command(msg)
+
+    def handle_gm_command(self, msg):
+        """Применяет одну команду от гейммастера. Выделено как метод, чтобы
+        его можно было вызывать из тестов без поднятия сокета."""
+        command = msg.get('command')
+
+        if command == 'start_turn':
+            self.log("🎮 GM: начинаем ход", 'success')
+            self.gm_start_event.set()
+
+        elif command == 'end_planning':
+            self.log("🎮 GM: принудительно завершает фазу планирования", 'warning')
+            self.gm_end_planning_event.set()
+
+        elif command == 'stop':
+            self.log("🎮 GM: остановка игры", 'warning')
+            self.gm_stop_event.set()
+            self.gm_start_event.set()
+            self.gm_end_planning_event.set()
+
+        elif command == 'set_timeout':
+            try:
+                seconds = int(msg.get('seconds', self.planning_timeout))
+            except (TypeError, ValueError):
+                self.log("❌ GM: set_timeout — нечисло", 'error')
+                return
+            if seconds < 5 or seconds > 600:
+                self.log("❌ GM: set_timeout вне диапазона 5..600", 'error')
+                return
+            self.planning_timeout = seconds
+            self.log(f"🎮 GM: таймаут фазы = {seconds}с", 'info')
+
+        elif command == 'override_ship':
+            ship_id = msg.get('ship_id')
+            with self.state_lock:
+                ship = self.game_state['ships'].get(ship_id)
+                if ship is None:
+                    self.log(f"❌ GM override: неизвестный ship_id {ship_id}", 'error')
+                    return
+                x = msg.get('x', ship.x)
+                y = msg.get('y', ship.y)
+                z = msg.get('z', ship.z)
+                if not (0 <= x < 10 and 0 <= y < 10 and 0 <= z < 10):
+                    self.log(f"❌ GM override: ({x},{y},{z}) вне куба", 'error')
+                    return
+                old = (ship.x, ship.y, ship.z, ship.alive)
+                ship.x, ship.y, ship.z = int(x), int(y), int(z)
+                if 'alive' in msg:
+                    ship.alive = bool(msg['alive'])
+                if 'hits' in msg:
+                    try:
+                        hits = int(msg['hits'])
+                        ship.hits = max(0, min(ship.max_hits, hits))
+                    except (TypeError, ValueError):
+                        pass
+                self.log(
+                    f"🎮 GM override {ship.name}: {old} → "
+                    f"({ship.x},{ship.y},{ship.z},alive={ship.alive},hits={ship.hits})",
+                    'warning',
+                )
+            self.send_state_to_all()
+
+        else:
+            self.log(f"⚠️ GM: неизвестная команда {command!r}", 'warning')
 
     def send_full_state_to_game_master(self):
         """Отправляет полное состояние гейммастеру."""
@@ -860,8 +973,13 @@ class GameServer:
                     'game_over': self.game_state['game_over'],
                     'winner': self.game_state['winner'],
                     'last_hits': self.game_state['last_hits'],
+                    'hit_history': self.game_state['hit_history'],
                     'message': f'Ход {self.game_state["turn"] + 1} - {self.game_state["phase"]}',
                     'game_mode': self.game_state['game_mode'],
+                    'planning_deadline': self.planning_deadline,
+                    'planning_timeout': self.planning_timeout,
+                    'actions_received_teams': [t.value for t in self.actions_received.keys()],
+                    'connected_teams': [t.value for t in self.clients.keys()],
                 }
             self.game_master_framed.send(state)
             self.log(f"📊 Отправлена полная карта гейммастеру", 'info')
@@ -879,13 +997,19 @@ class GameServer:
             self.send_state_to_team(team)
         self.send_full_state_to_game_master()
     
-    def receive_actions(self, timeout=60):
+    def receive_actions(self, timeout=None):
+        if timeout is None:
+            timeout = self.planning_timeout
         self.log(f"\n{'='*60}", 'system')
         self.log(f"⏳ СБОР ДЕЙСТВИЙ (таймаут: {timeout} сек)", 'system')
         self.log(f"{'='*60}", 'system')
 
         self.actions_received.clear()
         start_time = time.time()
+        self.planning_deadline = start_time + timeout
+        self.gm_end_planning_event.clear()
+        # Оповещаем всех о свежем дедлайне (чтобы клиенты смогли показать таймер).
+        self.send_state_to_all()
         dropped = []
 
         while time.time() - start_time < timeout and self.running:
@@ -918,12 +1042,20 @@ class GameServer:
             connected_teams = list(self.clients.keys())
             if connected_teams and all(team in self.actions_received for team in connected_teams):
                 self.log(f"\n✅ Все команды отправили действия!", 'success')
+                self.planning_deadline = None
                 return True
+
+            if self.gm_end_planning_event.is_set():
+                self.log("\n⏹  GM принудительно завершил фазу планирования", 'warning')
+                break
 
             time.sleep(0.05)
 
-        self.log(f"\n⏰ Время вышло!", 'warning')
+        if not self.gm_end_planning_event.is_set():
+            self.log(f"\n⏰ Время вышло!", 'warning')
 
+        self.gm_end_planning_event.clear()
+        self.planning_deadline = None
         for team in list(self.clients.keys()):
             if team not in self.actions_received:
                 self.actions_received[team] = []
@@ -1010,18 +1142,23 @@ class GameServer:
         # Применяем урон одним залпом — корабль мог погибнуть, но он всё равно
         # должен был успеть выстрелить в этот же ход.
         for attacker, target, pos in hit_records:
-            if not target.alive:
+            already_dead = not target.alive
+            if already_dead:
                 # Несколько попаданий в уже мёртвый корабль — всё равно лог.
                 self.log(f"   💀 {attacker.name} добивает {target.name}", 'info')
             target.take_hit()
+            killed = (not target.alive) and not already_dead
             hit_info = {
+                'turn': self.game_state['turn'] + 1,
                 'attacker': attacker.team.value,
                 'attacker_name': attacker.name,
                 'target': target.team.value,
                 'target_name': target.name,
                 'position': f"({pos[0]},{pos[1]},{pos[2]})",
+                'killed': killed,
             }
             self.game_state['last_hits'].append(hit_info)
+            self.game_state['hit_history'].append(hit_info)
             self.log(f"   ✅ {attacker.name} поразил {target.name}!", 'success')
 
         hits = [
@@ -1134,47 +1271,55 @@ class GameServer:
         self.log("\n⏳ ОЖИДАНИЕ ПОДКЛЮЧЕНИЙ...", 'system')
         while (len(self.clients) < 3 or self.game_master_framed is None) and self.running:
             time.sleep(1)
-        
+
         if not self.running:
             return
-        
+
         self.log(f"\n{'✅'*20}", 'success')
         self.log(f"     ВСЕ ПОДКЛЮЧЕНЫ!", 'success')
         self.log(f"     ИГРА НАЧИНАЕТСЯ!", 'success')
         self.log(f"{'✅'*20}\n", 'success')
-        
-        # Ждём команды от гейммастера
-        self.log("⏳ Ожидание команды гейммастера для начала игры...", 'info')
-        
+
         while self.running and not self.game_state['game_over']:
+            # Ждём команды «start_turn» от GM (первая итерация = старт игры,
+            # следующие = подтверждение перехода к следующему ходу). Это даёт
+            # GM контроль темпа, паузы и арбитража.
+            self.game_state['phase'] = 'waiting_for_gm'
+            self.log("\n⏳ Ожидание старта хода от гейммастера...", 'info')
+            self.send_state_to_all()
+
+            # wait даёт блокирующее ожидание с возможностью проснуться
+            # по stop_event (stop / разрыв с GM).
+            while self.running and not self.gm_start_event.wait(timeout=0.5):
+                if self.gm_stop_event.is_set():
+                    break
+            self.gm_start_event.clear()
+
+            if self.gm_stop_event.is_set() or not self.running:
+                break
+
             self.game_state['phase'] = 'planning'
             self.log(f"\n{'='*60}", 'system')
             self.log(f"🎯 ХОД {self.game_state['turn'] + 1} - ФАЗА ПЛАНИРОВАНИЯ", 'system')
             self.log(f"{'='*60}", 'system')
-            
-            self.send_state_to_all()
-            
-            self.log("\n⏳ Команды планируют свои ходы...", 'info')
-            self.log("📥 Гейммастер должен нажать Enter для сбора действий...", 'info')
-            
-            # Здесь сервер ждёт, пока гейммастер нажмёт Enter
-            # В реальном коде нужно добавить механизм ожидания команды от гейммастера
-            
+
             self.receive_actions()
-            
+
+            if self.gm_stop_event.is_set() or not self.running:
+                break
+
             continue_game = self.process_turn()
-            
+
             self.game_state['phase'] = 'results'
             self.send_state_to_all()
-            
+
             if not continue_game:
-                self.send_state_to_all()
                 break
-            
+
             if not self.game_state['game_over']:
                 self.log(f"\n{'─'*40}", 'system')
                 self.log("⏭️  Ожидание следующего хода...", 'info')
-        
+
         self.log("\n🎮 Игра завершена!", 'system')
     
     def stop(self):
