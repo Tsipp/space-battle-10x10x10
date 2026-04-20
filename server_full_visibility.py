@@ -674,22 +674,13 @@ class GameServer:
             # Продвинутый режим - разные типы
             self.log("🚀 Продвинутый режим: создаю разные типы кораблей", 'success')
 
-            # Баланс v4: случайный спавн. У каждой команды — свой фиксированный
-            # Z-слой (одна «высота»), чтобы все 8 кораблей команды начинали на
-            # одном этаже. Z-значения трёх команд различны (иначе пересекутся).
-            # X/Y в этом слое выбираются случайно, без коллизий.
+            # Баланс v5: спавн строго вдоль одной случайно выбранной оси
+            # на команду. Например, A = ось Z (ship_i имеет свои координаты
+            # по Z, но X и Y — общие для команды), B = ось X, C = ось Y.
+            # Оси и «линии» для трёх команд выбираются независимо, чтобы
+            # их клетки не пересекались.
             import random as _random
             spawn_rng = _random.Random(self.spawn_seed)
-            # Три разных Z из [0..9] для A, B, C.
-            z_layers = spawn_rng.sample(range(10), 3)
-            team_z = {Team.TEAM_A: z_layers[0],
-                      Team.TEAM_B: z_layers[1],
-                      Team.TEAM_C: z_layers[2]}
-            self.log(
-                f"   Стартовые Z-слои: A={team_z[Team.TEAM_A]}, "
-                f"B={team_z[Team.TEAM_B]}, C={team_z[Team.TEAM_C]}",
-                'info',
-            )
 
             type_order = [
                 ShipType.ARTILLERY, ShipType.RADIO, ShipType.JUMPER,
@@ -707,16 +698,50 @@ class GameServer:
                 ShipType.SPIDER: "Паук",
             }
 
+            used_cells = set()
             for team_letter, team in (("A", Team.TEAM_A),
                                       ("B", Team.TEAM_B),
                                       ("C", Team.TEAM_C)):
-                z = team_z[team]
-                # 100 клеток в слое, выбираем 8 уникальных.
-                positions = [(x, y) for x in range(10) for y in range(10)]
-                spawn_rng.shuffle(positions)
-                chosen = positions[:len(type_order)]
+                # Ищем «линию» — набор 8 клеток, лежащих вдоль одной оси, —
+                # которая не пересекает уже занятые клетки. Пробуем несколько
+                # раз (для маленькой карты 10^3 — почти всегда сразу ОК).
+                chosen_line = None
+                chosen_axis = None
+                for _ in range(200):
+                    axis = spawn_rng.choice(['x', 'y', 'z'])
+                    if axis == 'x':
+                        fixed_y = spawn_rng.randrange(10)
+                        fixed_z = spawn_rng.randrange(10)
+                        xs = spawn_rng.sample(range(10), len(type_order))
+                        line = [(x, fixed_y, fixed_z) for x in xs]
+                    elif axis == 'y':
+                        fixed_x = spawn_rng.randrange(10)
+                        fixed_z = spawn_rng.randrange(10)
+                        ys = spawn_rng.sample(range(10), len(type_order))
+                        line = [(fixed_x, y, fixed_z) for y in ys]
+                    else:
+                        fixed_x = spawn_rng.randrange(10)
+                        fixed_y = spawn_rng.randrange(10)
+                        zs = spawn_rng.sample(range(10), len(type_order))
+                        line = [(fixed_x, fixed_y, z) for z in zs]
+                    if not any(cell in used_cells for cell in line):
+                        chosen_line = line
+                        chosen_axis = axis
+                        break
+                if chosen_line is None:
+                    # Крайний аварийный случай — всё же выставляем вдоль Z
+                    # от (0, team_letter_index, 0..7).
+                    fallback_y = (ord(team_letter) - ord('A'))
+                    chosen_line = [(0, fallback_y, z) for z in range(len(type_order))]
+                    chosen_axis = 'z'
+                used_cells.update(chosen_line)
+                self.log(
+                    f"   Команда {team_letter}: спавн вдоль оси {chosen_axis.upper()} "
+                    f"от {chosen_line[0]} до {chosen_line[-1]}",
+                    'info',
+                )
                 for idx, ship_type in enumerate(type_order):
-                    x, y = chosen[idx]
+                    x, y, z = chosen_line[idx]
                     sid = f"{team_letter}_{idx + 1}"
                     ships[sid] = Ship(
                         sid,
@@ -755,7 +780,9 @@ class GameServer:
                         abs(ship.y - ally.y),
                         abs(ship.z - ally.z)
                     )
-                    if distance <= 3:
+                    # Баланс v4: видимость 3→4, чтобы команды раньше находили
+                    # друг друга после рандомного спавна по разным осям.
+                    if distance <= 4:
                         visible = True
                         break
 

@@ -75,7 +75,8 @@ class Ship:
             # Баланс v2: hp 1→2, чтобы крейсер не сносился с одного залпа
             # другого крейсера/артиллерии (damage=2).
             self.max_hits = 2
-            self.move_range = 1
+            # Баланс v5: +1 к move_range всем мобильным кораблям.
+            self.move_range = 2
             self.can_shoot = True
             self.shoot_range = 5
             self.shoot_anywhere = False  # Только по прямой
@@ -94,7 +95,8 @@ class Ship:
         elif ship_type == ShipType.RADIO:
             # По тз (03.дополнения): hp=3 для радиовышки.
             self.max_hits = 3
-            self.move_range = 1
+            # Баланс v5: +1 к move_range всем мобильным.
+            self.move_range = 2
             self.can_shoot = False  # Радиовышка не стреляет
             self.shoot_range = 0
             self.scan_whole_z = True  # Сканирует всю плоскость Z
@@ -104,7 +106,9 @@ class Ship:
             # Прыгун: hp=2, прыжок на 3 клетки сквозь корабли,
             # разрушает корабль в конечной точке. Атака 1.
             self.max_hits = 2
-            self.move_range = 3
+            # Баланс v5: +1 move_range (на случай обычного перемещения;
+            # jump_range — отдельный авторитетный параметр).
+            self.move_range = 4
             # Баланс v3: jump_range 3→2 (было имбой, убивал артиллерию в 1 таран
             # на дальность 3). Сохраняем высокую мобильность за счёт move=3.
             self.jump_range = 2
@@ -118,7 +122,8 @@ class Ship:
             # move=1, атака 1. Главный корабль-саппорт — держим его живым
             # дольше, иначе в прошлых прогонах он получал dmg 367 против 47.
             self.max_hits = 6
-            self.move_range = 1
+            # Баланс v5: +1 move_range.
+            self.move_range = 2
             # Баланс v3: heal_range 1→2, чтобы Факел реально успевал лечить
             # больше союзников за один AoE.
             self.heal_range = 2
@@ -131,7 +136,8 @@ class Ship:
             # Тишина: hp=2, move=1, атака 0,
             # уходит в «фазу» — неатакуемая, но сама не стреляет.
             self.max_hits = 2
-            self.move_range = 1
+            # Баланс v5: +1 move_range.
+            self.move_range = 2
             self.can_shoot = False
             self.shoot_range = 0
             self.can_phase = True
@@ -142,7 +148,8 @@ class Ship:
             # прямое движение на 3 клетки сквозь всех,
             # мгновенно убивает корабль, на котором закончил движение.
             self.max_hits = 4
-            self.move_range = 2
+            # Баланс v5: +1 move_range.
+            self.move_range = 3
             self.drill_range = 3
             self.can_shoot = False
             self.shoot_range = 0
@@ -152,7 +159,8 @@ class Ship:
             # Провокатор: hp=2, move=1, атака 1,
             # создаёт голограмму в соседней пустой клетке.
             self.max_hits = 2
-            self.move_range = 1
+            # Баланс v5: +1 move_range.
+            self.move_range = 2
             self.can_shoot = True
             self.shoot_range = 5
             self.shoot_anywhere = False
@@ -163,7 +171,8 @@ class Ship:
             # Паук: hp=1, move=1, атака 0, ставит мины в соседние клетки,
             # которые дают 2 единицы урона.
             self.max_hits = 1
-            self.move_range = 1
+            # Баланс v5: +1 move_range.
+            self.move_range = 2
             self.can_shoot = False
             self.shoot_range = 0
             self.can_place_mine = True
@@ -172,7 +181,8 @@ class Ship:
 
         else:  # Базовый
             self.max_hits = 2
-            self.move_range = 1
+            # Баланс v5: +1 move_range.
+            self.move_range = 2
             self.can_shoot = True
             self.shoot_range = 5
             self.shoot_anywhere = False

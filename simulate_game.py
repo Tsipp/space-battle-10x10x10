@@ -884,7 +884,7 @@ def simulate(
                 exclusive = []
                 for e in enemies_in_z:
                     in_normal_vision = any(
-                        max(abs(e.x - a.x), abs(e.y - a.y), abs(e.z - a.z)) <= 3
+                        max(abs(e.x - a.x), abs(e.y - a.y), abs(e.z - a.z)) <= 4
                         for a in team_allies
                     )
                     if not in_normal_vision:

@@ -209,10 +209,11 @@ class TestVisibility:
         assert "B1" in visible
         assert "B2" not in visible
 
-    def test_regular_visibility_radius_3(self, server):
+    def test_regular_visibility_radius_4(self, server):
+        """Баланс v4: радиус видимости 3→4."""
         ally = _ship("A1", Team.TEAM_A, 5, 5, 5, ShipType.BASE)
-        near = _ship("B1", Team.TEAM_B, 7, 5, 5, ShipType.BASE)  # дистанция 2
-        far = _ship("B2", Team.TEAM_B, 9, 5, 5, ShipType.BASE)  # дистанция 4
+        near = _ship("B1", Team.TEAM_B, 9, 5, 5, ShipType.BASE)  # дистанция 4 — видно
+        far = _ship("B2", Team.TEAM_B, 0, 5, 5, ShipType.BASE)  # дистанция 5 — не видно
         _set_ships(server, [ally, near, far])
         visible = server.get_visible_enemies(Team.TEAM_A)
         assert "B1" in visible

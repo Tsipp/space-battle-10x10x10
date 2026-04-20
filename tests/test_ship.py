@@ -12,7 +12,7 @@ class TestShipDefaults:
     def test_base_defaults(self):
         s = make(ship_type=ShipType.BASE)
         assert s.max_hits == 2
-        assert s.move_range == 1
+        assert s.move_range == 2
         assert s.shoot_range == 5
         assert s.can_shoot is True
         assert s.shoot_anywhere is False
@@ -24,7 +24,7 @@ class TestShipDefaults:
         s = make(ship_type=ShipType.CRUISER)
         # Баланс v2: hp 1→2.
         assert s.max_hits == 2
-        assert s.move_range == 1
+        assert s.move_range == 2
         assert s.shoot_range == 5
         assert s.can_shoot is True
         assert s.shoot_anywhere is False
@@ -59,7 +59,7 @@ class TestNewShipTypes:
     def test_jumper(self):
         s = make(ship_type=ShipType.JUMPER)
         assert s.max_hits == 2
-        assert s.move_range == 3
+        assert s.move_range == 4
         assert s.jump_range == 2
         assert s.damage == 1
         assert s.can_shoot is True
@@ -68,14 +68,14 @@ class TestNewShipTypes:
         s = make(ship_type=ShipType.TORCH)
         # Баланс v2: hp 5→6.
         assert s.max_hits == 6
-        assert s.move_range == 1
+        assert s.move_range == 2
         assert s.heal_range == 2
         assert s.damage == 1
 
     def test_silence(self):
         s = make(ship_type=ShipType.SILENCE)
         assert s.max_hits == 2
-        assert s.move_range == 1
+        assert s.move_range == 2
         assert s.can_phase is True
         assert s.can_shoot is False
         assert s.damage == 0
@@ -83,7 +83,7 @@ class TestNewShipTypes:
     def test_drill(self):
         s = make(ship_type=ShipType.DRILL)
         assert s.max_hits == 4
-        assert s.move_range == 2
+        assert s.move_range == 3
         assert s.drill_range == 3
         assert s.can_shoot is False
         assert s.damage == 0
@@ -91,14 +91,14 @@ class TestNewShipTypes:
     def test_provocateur(self):
         s = make(ship_type=ShipType.PROVOCATEUR)
         assert s.max_hits == 2
-        assert s.move_range == 1
+        assert s.move_range == 2
         assert s.can_create_hologram is True
         assert s.damage == 1
 
     def test_spider(self):
         s = make(ship_type=ShipType.SPIDER)
         assert s.max_hits == 1
-        assert s.move_range == 1
+        assert s.move_range == 2
         assert s.can_place_mine is True
         assert s.mine_damage == 2
         assert s.can_shoot is False
@@ -123,8 +123,9 @@ class TestMove:
         assert (s.x, s.y, s.z) == (6, 5, 5)
 
     def test_move_over_range_rejected(self):
+        # Баланс v5: Базовый имеет move_range=2, поэтому >2 отклоняется.
         s = make(x=5, y=5, z=5)
-        assert s.move(7, 5, 5) is False
+        assert s.move(8, 5, 5) is False
         assert (s.x, s.y, s.z) == (5, 5, 5)
 
     def test_move_out_of_bounds(self):
