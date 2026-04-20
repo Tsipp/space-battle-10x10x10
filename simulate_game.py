@@ -516,7 +516,8 @@ class TeamBot:
                     ship.id, ActionType.MOVE, best_enemy.x, best_enemy.y, best_enemy.z
                 )
 
-        # Бурав: такая же логика приоритета, но только по одной оси.
+        # Бурав: одноосевая прямая ИЛИ строгая диагональ по 2 осям
+        # (баланс v4). Ранжируем цели по damage × hp_left, затем — ближе.
         if getattr(ship, 'drill_range', 0) > 0 and visible_ships:
             drill_candidates = []
             for enemy in visible_ships:
@@ -524,15 +525,19 @@ class TeamBot:
                     continue
                 if getattr(enemy, 'is_hologram', False):
                     continue
-                axes = (
-                    (1 if enemy.x != ship.x else 0)
-                    + (1 if enemy.y != ship.y else 0)
-                    + (1 if enemy.z != ship.z else 0)
-                )
-                d = max(
-                    abs(enemy.x - ship.x), abs(enemy.y - ship.y), abs(enemy.z - ship.z)
-                )
-                if not (axes == 1 and 1 <= d <= ship.drill_range):
+                dx_s = abs(enemy.x - ship.x)
+                dy_s = abs(enemy.y - ship.y)
+                dz_s = abs(enemy.z - ship.z)
+                axes = (1 if dx_s else 0) + (1 if dy_s else 0) + (1 if dz_s else 0)
+                d = max(dx_s, dy_s, dz_s)
+                legal = False
+                if axes == 1 and 1 <= d <= ship.drill_range:
+                    legal = True
+                elif axes == 2:
+                    nonzero = [v for v in (dx_s, dy_s, dz_s) if v]
+                    if nonzero[0] == nonzero[1] and 1 <= nonzero[0] <= ship.drill_range:
+                        legal = True
+                if not legal:
                     continue
                 if (enemy.x, enemy.y, enemy.z) in reserved:
                     continue
@@ -765,7 +770,8 @@ def simulate(
     transcript = TranscriptLogger()
 
     server = GameServer(
-        host='127.0.0.1', port=0, game_mode=game_mode, gui=transcript
+        host='127.0.0.1', port=0, game_mode=game_mode, gui=transcript,
+        spawn_seed=seed,
     )
     # GameServer в __init__ уже сделал create_ships и залогировал в gui.
 

@@ -553,11 +553,16 @@ class GameServerGUI:
         self.root.mainloop()
 
 class GameServer:
-    def __init__(self, host='0.0.0.0', port=5555, game_mode='advanced', gui=None):
+    def __init__(self, host='0.0.0.0', port=5555, game_mode='advanced', gui=None,
+                 spawn_seed=None):
         self.host = host
         self.port = port
         self.game_mode = game_mode
         self.gui = gui  # Ссылка на GUI для логирования
+        # spawn_seed — детерминизирует случайные стартовые позиции. Если None,
+        # используется time.time() (каждый запуск разный). Для тестов/симуляций
+        # передавать явное число.
+        self.spawn_seed = spawn_seed
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.clients = {}  # team -> Framed
@@ -668,37 +673,56 @@ class GameServer:
         else:
             # Продвинутый режим - разные типы
             self.log("🚀 Продвинутый режим: создаю разные типы кораблей", 'success')
-            
-            # Команда A — стартует на грани x=0
-            # (Базовый и Крейсер убраны из advanced — Крейсер и есть «базовый».)
-            ships["A_1"] = Ship("A_1", "Артиллерия A1", Team.TEAM_A, 0, 0, 0, ShipType.ARTILLERY)
-            ships["A_2"] = Ship("A_2", "Радиовышка A2", Team.TEAM_A, 0, 2, 0, ShipType.RADIO)
-            ships["A_3"] = Ship("A_3", "Прыгун A3", Team.TEAM_A, 0, 4, 0, ShipType.JUMPER)
-            ships["A_4"] = Ship("A_4", "Факел A4", Team.TEAM_A, 0, 6, 0, ShipType.TORCH)
-            ships["A_5"] = Ship("A_5", "Тишина A5", Team.TEAM_A, 0, 8, 0, ShipType.SILENCE)
-            ships["A_6"] = Ship("A_6", "Бурав A6", Team.TEAM_A, 0, 1, 1, ShipType.DRILL)
-            ships["A_7"] = Ship("A_7", "Провокатор A7", Team.TEAM_A, 0, 3, 1, ShipType.PROVOCATEUR)
-            ships["A_8"] = Ship("A_8", "Паук A8", Team.TEAM_A, 0, 5, 1, ShipType.SPIDER)
 
-            # Команда B — стартует на грани x=9
-            ships["B_1"] = Ship("B_1", "Артиллерия B1", Team.TEAM_B, 9, 9, 9, ShipType.ARTILLERY)
-            ships["B_2"] = Ship("B_2", "Радиовышка B2", Team.TEAM_B, 9, 7, 9, ShipType.RADIO)
-            ships["B_3"] = Ship("B_3", "Прыгун B3", Team.TEAM_B, 9, 5, 9, ShipType.JUMPER)
-            ships["B_4"] = Ship("B_4", "Факел B4", Team.TEAM_B, 9, 3, 9, ShipType.TORCH)
-            ships["B_5"] = Ship("B_5", "Тишина B5", Team.TEAM_B, 9, 1, 9, ShipType.SILENCE)
-            ships["B_6"] = Ship("B_6", "Бурав B6", Team.TEAM_B, 9, 8, 8, ShipType.DRILL)
-            ships["B_7"] = Ship("B_7", "Провокатор B7", Team.TEAM_B, 9, 6, 8, ShipType.PROVOCATEUR)
-            ships["B_8"] = Ship("B_8", "Паук B8", Team.TEAM_B, 9, 4, 8, ShipType.SPIDER)
+            # Баланс v4: случайный спавн. У каждой команды — свой фиксированный
+            # Z-слой (одна «высота»), чтобы все 8 кораблей команды начинали на
+            # одном этаже. Z-значения трёх команд различны (иначе пересекутся).
+            # X/Y в этом слое выбираются случайно, без коллизий.
+            import random as _random
+            spawn_rng = _random.Random(self.spawn_seed)
+            # Три разных Z из [0..9] для A, B, C.
+            z_layers = spawn_rng.sample(range(10), 3)
+            team_z = {Team.TEAM_A: z_layers[0],
+                      Team.TEAM_B: z_layers[1],
+                      Team.TEAM_C: z_layers[2]}
+            self.log(
+                f"   Стартовые Z-слои: A={team_z[Team.TEAM_A]}, "
+                f"B={team_z[Team.TEAM_B]}, C={team_z[Team.TEAM_C]}",
+                'info',
+            )
 
-            # Команда C — стартует на грани y=9
-            ships["C_1"] = Ship("C_1", "Артиллерия C1", Team.TEAM_C, 4, 9, 4, ShipType.ARTILLERY)
-            ships["C_2"] = Ship("C_2", "Радиовышка C2", Team.TEAM_C, 5, 9, 4, ShipType.RADIO)
-            ships["C_3"] = Ship("C_3", "Прыгун C3", Team.TEAM_C, 6, 9, 4, ShipType.JUMPER)
-            ships["C_4"] = Ship("C_4", "Факел C4", Team.TEAM_C, 7, 9, 4, ShipType.TORCH)
-            ships["C_5"] = Ship("C_5", "Тишина C5", Team.TEAM_C, 8, 9, 4, ShipType.SILENCE)
-            ships["C_6"] = Ship("C_6", "Бурав C6", Team.TEAM_C, 4, 9, 5, ShipType.DRILL)
-            ships["C_7"] = Ship("C_7", "Провокатор C7", Team.TEAM_C, 6, 9, 5, ShipType.PROVOCATEUR)
-            ships["C_8"] = Ship("C_8", "Паук C8", Team.TEAM_C, 7, 9, 5, ShipType.SPIDER)
+            type_order = [
+                ShipType.ARTILLERY, ShipType.RADIO, ShipType.JUMPER,
+                ShipType.TORCH, ShipType.SILENCE, ShipType.DRILL,
+                ShipType.PROVOCATEUR, ShipType.SPIDER,
+            ]
+            type_names = {
+                ShipType.ARTILLERY: "Артиллерия",
+                ShipType.RADIO: "Радиовышка",
+                ShipType.JUMPER: "Прыгун",
+                ShipType.TORCH: "Факел",
+                ShipType.SILENCE: "Тишина",
+                ShipType.DRILL: "Бурав",
+                ShipType.PROVOCATEUR: "Провокатор",
+                ShipType.SPIDER: "Паук",
+            }
+
+            for team_letter, team in (("A", Team.TEAM_A),
+                                      ("B", Team.TEAM_B),
+                                      ("C", Team.TEAM_C)):
+                z = team_z[team]
+                # 100 клеток в слое, выбираем 8 уникальных.
+                positions = [(x, y) for x in range(10) for y in range(10)]
+                spawn_rng.shuffle(positions)
+                chosen = positions[:len(type_order)]
+                for idx, ship_type in enumerate(type_order):
+                    x, y = chosen[idx]
+                    sid = f"{team_letter}_{idx + 1}"
+                    ships[sid] = Ship(
+                        sid,
+                        f"{type_names[ship_type]} {team_letter}{idx + 1}",
+                        team, x, y, z, ship_type,
+                    )
         
         self.game_state['ships'] = ships
         self.log(f"✅ Создано {len(ships)} кораблей", 'success')
@@ -1631,9 +1655,25 @@ class GameServer:
 
         if is_drill:
             axes_changed = (1 if dx else 0) + (1 if dy else 0) + (1 if dz else 0)
-            if axes_changed != 1:
-                self.log(f"   ⚠️ {ship.name}: Бурав двигается только по одной оси", 'warning')
+            # Баланс v4: Бурав получил диагональную атаку — можно двигаться
+            # по 1 оси (как раньше) или по 2 осям, но только по настоящей
+            # диагонали (одинаковые смещения по обеим осям). 3D-диагональ
+            # (axes_changed=3) не разрешена, чтобы не стать слишком имбой.
+            if axes_changed == 0 or axes_changed == 3:
+                self.log(
+                    f"   ⚠️ {ship.name}: Бурав двигается только по 1 оси или "
+                    f"по 2 осям строго диагонально", 'warning'
+                )
                 return False
+            if axes_changed == 2:
+                nonzero = [d for d in (dx, dy, dz) if d]
+                if nonzero[0] != nonzero[1]:
+                    self.log(
+                        f"   ⚠️ {ship.name}: диагональ должна быть строгой "
+                        f"(равные смещения по 2 осям, получено {nonzero})",
+                        'warning'
+                    )
+                    return False
 
         # Корабли в фазе (Тишина с is_phased=True) прозрачны и неосязаемы:
         # другие корабли могут свободно проходить/приземляться в их клетку, как

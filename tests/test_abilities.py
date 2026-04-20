@@ -124,12 +124,36 @@ class TestDrill:
         assert not enemy.alive, "Бурав уничтожает корабль в конечной клетке"
         assert (drill.x, drill.y, drill.z) == (3, 0, 0)
 
-    def test_drill_must_go_straight(self, server):
-        """Бурав не может двигаться по диагонали — отклоняется."""
+    def test_drill_diagonal_2d_allowed(self, server):
+        """Баланс v4: Бурав умеет 2D-диагональ (равные смещения по 2 осям)."""
+        drill = _ship("A1", Team.TEAM_A, 0, 0, 0, ShipType.DRILL)
+        enemy = _ship("B1", Team.TEAM_B, 2, 2, 0, ShipType.ARTILLERY)
+        _set_ships(server, [drill, enemy])
+        server.actions_received = {
+            Team.TEAM_A: [Action("A1", ActionType.MOVE, 2, 2, 0)],
+            Team.TEAM_B: [], Team.TEAM_C: [],
+        }
+        server.process_turn()
+        assert (drill.x, drill.y, drill.z) == (2, 2, 0)
+        assert not enemy.alive, "Бурав убивает врага в конечной диагональной клетке"
+
+    def test_drill_rejects_unequal_2axis(self, server):
+        """Неравная «диагональ» (2-0-1 или 3-0-1) — отклоняется."""
         drill = _ship("A1", Team.TEAM_A, 0, 0, 0, ShipType.DRILL)
         _set_ships(server, [drill])
         server.actions_received = {
-            Team.TEAM_A: [Action("A1", ActionType.MOVE, 2, 2, 0)],
+            Team.TEAM_A: [Action("A1", ActionType.MOVE, 2, 1, 0)],  # dx=2, dy=1
+            Team.TEAM_B: [], Team.TEAM_C: [],
+        }
+        server.process_turn()
+        assert (drill.x, drill.y, drill.z) == (0, 0, 0)
+
+    def test_drill_rejects_3axis(self, server):
+        """3D-диагональ всё ещё запрещена (слишком сильная атака)."""
+        drill = _ship("A1", Team.TEAM_A, 0, 0, 0, ShipType.DRILL)
+        _set_ships(server, [drill])
+        server.actions_received = {
+            Team.TEAM_A: [Action("A1", ActionType.MOVE, 2, 2, 2)],
             Team.TEAM_B: [], Team.TEAM_C: [],
         }
         server.process_turn()
