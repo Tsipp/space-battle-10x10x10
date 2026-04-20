@@ -6,343 +6,569 @@ from tkinter import *
 from tkinter import ttk, messagebox, font
 from shared_simple import *
 from protocol import Framed, ProtocolError
+from ui_theme import (
+    Palette, Fonts, TEAM_COLORS, SHIP_TYPE_INFO,
+    ship_icon, ship_short, ship_role, ship_accent, hp_color, apply_theme,
+)
+
+
+# --------------------------------------------------------------------------- #
+# Tooltip — всплывающая подсказка для любого виджета.
+# --------------------------------------------------------------------------- #
+
+class Tooltip:
+    """Лёгкий tooltip на чистом Tkinter.
+
+    Использование::
+
+        Tooltip(widget, lambda: "Мой текст")
+
+    Лейбл позиционируется справа-снизу курсора и прячется при уходе мыши.
+    """
+
+    def __init__(self, widget, text_provider, delay_ms: int = 250):
+        self.widget = widget
+        self.text_provider = text_provider
+        self.delay = delay_ms
+        self._after_id = None
+        self._tw = None
+        self._palette = Palette()
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _event=None):
+        self._cancel()
+        self._after_id = self.widget.after(self.delay, self._show)
+
+    def _cancel(self):
+        if self._after_id is not None:
+            try:
+                self.widget.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+
+    def _show(self):
+        text = None
+        try:
+            text = self.text_provider() if callable(self.text_provider) else self.text_provider
+        except Exception:
+            text = None
+        if not text:
+            return
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self._tw = Toplevel(self.widget)
+        self._tw.wm_overrideredirect(True)
+        self._tw.wm_geometry(f"+{x}+{y}")
+        self._tw.configure(bg=self._palette.border_strong)
+        Label(
+            self._tw, text=text, justify=LEFT,
+            bg=self._palette.bg_card, fg=self._palette.fg_primary,
+            font=("DejaVu Sans", 9), padx=8, pady=4,
+            relief=FLAT, bd=0,
+        ).pack(padx=1, pady=1)
+
+    def _hide(self, _event=None):
+        self._cancel()
+        if self._tw is not None:
+            try:
+                self._tw.destroy()
+            except Exception:
+                pass
+            self._tw = None
+
 
 class MapWindow:
+    """Окно карты 10×10×10 (слой Z — активный).
+
+    Версия v2 (UI overhaul):
+    • Каждая клетка — отдельный Canvas ~CELL_SIZE px, что позволяет рисовать:
+      иконку типа корабля, HP-бар (цвет зависит от hp/max_hp), бейдж хитов,
+      маркер фазы/мины; без нагромождения Label-ов.
+    • Единая тема из ui_theme.py.
+    • Tooltip при hover показывает полный статус (тип, HP, дальности, фаза).
+    • Подсветка легальных клеток (зелёная — ход, янтарная — стрельба/таран),
+      выделение выбранной цели — белая рамка.
+    • Отдельный слой Z-mini: 10 «столбиков» слева от карты показывают,
+      на каких Z-слоях есть свои/вражеские корабли.
+
+    Публичный контракт (не менять — используется GameClientGUI):
+      self.window              — Toplevel
+      self.current_layer       — IntVar (0..9)
+      update_data(ships, enem) — обновить данные и перерисовать
+      set_targeting(legal, selected, mode)
+      clear_targeting()
+    """
+
+    CELL_SIZE = 54     # ширина/высота квадрата одной клетки карты, px.
+    GRID_SIZE = 10
+
     def __init__(self, parent, team_name, team_color, gui=None):
         self.parent = parent
-        # Ссылка на GameClientGUI — нужна, чтобы обрабатывать клики по карте
-        # (пробрасывание координат в форму планирования).
         self.gui = gui
         self.team_name = team_name
         self.team_color = team_color
+        self.palette = Palette()
+        self.fonts = Fonts()
         self.window = Toplevel(parent)
-        self.window.title(f"🗺️ Карта - {team_name}")
-        self.window.geometry("900x700")
-        self.window.configure(bg='#0a0e27')
+        self.window.title(f"🗺 Карта — {team_name}")
+        cell = self.CELL_SIZE
+        # Ширина: 10 клеток карты + левая Z-колонка + поля.
+        width = cell * self.GRID_SIZE + 160
+        # Высота: заголовок + карта + легенда + статус.
+        height = cell * self.GRID_SIZE + 220
+        self.window.geometry(f"{width}x{height}")
+        apply_theme(self.window, self.palette, self.fonts)
 
-        # Переменные
         self.current_layer = IntVar(value=0)
         self.ships_data = {}
         self.enemies_data = {}
-        # Подсветка легальных клеток и выбранной цели — задаётся родителем
-        # (GameClientGUI) через set_targeting() во время планирования действий.
-        self._legal_cells = set()       # множество (x, y, z)
-        self._selected_target = None    # (x, y, z) или None
-        self._targeting_mode = None     # "move" / "shoot" / None (цвет)
-        
-        # Цветовая схема
-        self.colors = {
-            'bg': '#0a0e27',
-            'bg2': '#1a1f3a',
-            'fg': '#ffffff',
-            'accent1': '#00d4ff',
-            'accent2': '#ff6b6b',
-            'accent3': '#6bff6b',
-            'accent4': '#ffd700',
-            'panel': '#151a33',
-            'text': '#e0e0ff'
-        }
-        
-        # Создаем интерфейс
-        self.create_widgets()
-        
-    def create_widgets(self):
-        # Верхняя панель с заголовком
-        header_frame = Frame(self.window, bg='#000000', height=60)
-        header_frame.pack(fill=X)
-        header_frame.pack_propagate(False)
-        
-        header_label = Label(header_frame, 
-                            text=f"🗺️ КАРТА {self.team_name}",
-                            bg='#000000', fg=self.team_color,
-                            font=('Arial', 18, 'bold'))
-        header_label.pack(expand=True)
-        
-        # Панель управления слоями
-        control_frame = Frame(self.window, bg=self.colors['panel'], height=50)
-        control_frame.pack(fill=X, padx=10, pady=10)
-        control_frame.pack_propagate(False)
-        
-        # Слайдер слоёв с красивым оформлением
-        Label(control_frame, text="🔽 Слой (Z):", 
-              bg=self.colors['panel'], fg=self.colors['text'],
-              font=('Arial', 11)).pack(side=LEFT, padx=10)
-        
-        layer_scale = Scale(control_frame, from_=0, to=9, variable=self.current_layer,
-                           orient=HORIZONTAL, length=300,
-                           bg=self.colors['panel'], fg=self.colors['accent1'],
-                           troughcolor=self.colors['bg2'],
-                           activebackground=self.colors['accent1'],
-                           highlightbackground=self.colors['panel'])
-        layer_scale.pack(side=LEFT, padx=10)
-        
-        self.layer_label = Label(control_frame, text="Z = 0",
-                                bg=self.colors['panel'], fg=self.colors['accent1'],
-                                font=('Arial', 14, 'bold'))
-        self.layer_label.pack(side=LEFT, padx=20)
-        
-        # Кнопка обновления
-        update_btn = Button(control_frame, text="🔄 Обновить",
-                           bg=self.colors['accent1'], fg='black',
-                           font=('Arial', 10, 'bold'),
-                           command=self.update_map)
-        update_btn.pack(side=RIGHT, padx=10)
-        
-        # Карта
-        map_container = Frame(self.window, bg=self.colors['bg2'], bd=2, relief=SUNKEN)
-        map_container.pack(fill=BOTH, expand=True, padx=10, pady=10)
-        
-        self.map_frame = Frame(map_container, bg=self.colors['bg2'])
-        self.map_frame.pack(expand=True)
-        
-        # Создаем сетку 10x10. row = y, col = x (см. update_map и отрисовку).
-        self.cells = []
-        for row in range(10):
-            row_cells = []
-            for col in range(10):
-                cell = Label(self.map_frame, text=" ", width=4, height=2,
-                           relief=RAISED, borderwidth=2,
-                           font=('Arial', 10, 'bold'),
-                           bg=self.colors['bg2'], fg='white')
-                cell.grid(row=row, column=col, padx=2, pady=2)
-                # Клик по клетке: колонка = x, строка = y, z = текущий слой.
-                cell.bind(
+        self._legal_cells = set()
+        self._selected_target = None
+        self._targeting_mode = None
+        # (row, col) -> Canvas.
+        self._cells = {}
+        self._cell_tooltip_text = {}     # (x, y) -> str
+        self._cell_tooltip_objs = {}     # (x, y) -> Tooltip
+        # Колонки Z-мини-миникарты (0..9) -> Canvas.
+        self._z_columns = {}
+
+        self._build()
+        self.current_layer.trace("w", self._on_layer_change)
+
+    # --------------------------------------------------------------- build ---
+
+    def _build(self):
+        p = self.palette
+        f = self.fonts
+
+        # Заголовок — крупная плашка с именем команды и подсказкой.
+        header = Frame(self.window, bg=p.bg_root, height=60)
+        header.pack(fill=X)
+        header.pack_propagate(False)
+        Label(
+            header, text=f"🗺  КАРТА  •  {self.team_name}",
+            bg=p.bg_root, fg=self.team_color, font=f.h1,
+        ).pack(side=LEFT, padx=18, pady=10)
+        Label(
+            header,
+            text="X →   Y ↓   Z-слой ниже",
+            bg=p.bg_root, fg=p.fg_secondary, font=f.small,
+        ).pack(side=RIGHT, padx=18)
+
+        # Панель управления слоем (scale + label).
+        control = Frame(self.window, bg=p.bg_panel, height=46)
+        control.pack(fill=X, padx=10, pady=(0, 6))
+        control.pack_propagate(False)
+        Label(
+            control, text="Слой Z:", bg=p.bg_panel, fg=p.fg_secondary,
+            font=f.body,
+        ).pack(side=LEFT, padx=(14, 6))
+        Scale(
+            control, from_=0, to=9, variable=self.current_layer,
+            orient=HORIZONTAL, length=280, showvalue=False,
+            bg=p.bg_panel, fg=p.accent_info, troughcolor=p.bg_root,
+            activebackground=p.accent_info,
+            highlightbackground=p.bg_panel, bd=0,
+        ).pack(side=LEFT, padx=6)
+        self.layer_label = Label(
+            control, text="Z = 0", bg=p.bg_panel, fg=p.accent_info,
+            font=f.h2, width=7, anchor=W,
+        )
+        self.layer_label.pack(side=LEFT, padx=10)
+        Button(
+            control, text="🔄 Обновить", bg=p.accent_info, fg="#06122a",
+            font=f.body_bold, bd=0, relief=FLAT, padx=14, pady=4,
+            activebackground="#3be6ff", activeforeground="#06122a",
+            command=self.update_map,
+        ).pack(side=RIGHT, padx=12)
+
+        # Основное тело: слева Z-миникарта, справа — карта 10×10.
+        body = Frame(self.window, bg=p.bg_root)
+        body.pack(fill=BOTH, expand=True, padx=10, pady=2)
+
+        # Z-миникарта: вертикальная колонка 10 ячеек (Z=9 сверху → Z=0 снизу
+        # соответствует восприятию «высота») + стрелка «вы здесь».
+        zmini = Frame(body, bg=p.bg_panel, bd=0)
+        zmini.pack(side=LEFT, fill=Y, padx=(2, 10))
+        Label(
+            zmini, text="Z-слои", bg=p.bg_panel, fg=p.fg_secondary,
+            font=f.small_bold,
+        ).pack(anchor=N, pady=(6, 4))
+        zmini_grid = Frame(zmini, bg=p.bg_panel)
+        zmini_grid.pack(padx=4, pady=2)
+        for z in range(9, -1, -1):
+            row = Frame(zmini_grid, bg=p.bg_panel)
+            row.pack(anchor=W, pady=1)
+            marker = Canvas(
+                row, width=14, height=14, bg=p.bg_panel,
+                highlightthickness=0,
+            )
+            marker.pack(side=LEFT)
+            Label(
+                row, text=f"Z{z}", bg=p.bg_panel, fg=p.fg_secondary,
+                font=f.small, width=3, anchor=W,
+            ).pack(side=LEFT)
+            bar = Canvas(
+                row, width=90, height=14, bg=p.bg_panel,
+                highlightthickness=0, cursor="hand2",
+            )
+            bar.pack(side=LEFT, padx=4)
+            bar.bind(
+                "<Button-1>",
+                lambda _e, z=z: self.current_layer.set(z),
+            )
+            marker.bind(
+                "<Button-1>",
+                lambda _e, z=z: self.current_layer.set(z),
+            )
+            self._z_columns[z] = (marker, bar)
+
+        # Карта.
+        grid_wrap = Frame(body, bg=p.bg_panel, bd=0)
+        grid_wrap.pack(side=LEFT, padx=0, pady=0)
+
+        # Верхняя шкала X (0..9).
+        for col in range(self.GRID_SIZE):
+            Label(
+                grid_wrap, text=str(col), bg=p.bg_panel, fg=p.fg_muted,
+                font=self.fonts.small_bold, width=2,
+            ).grid(row=0, column=col + 1, padx=0, pady=(2, 1))
+
+        for row in range(self.GRID_SIZE):
+            Label(
+                grid_wrap, text=str(row), bg=p.bg_panel, fg=p.fg_muted,
+                font=self.fonts.small_bold, width=2,
+            ).grid(row=row + 1, column=0, padx=(2, 4), pady=0)
+            for col in range(self.GRID_SIZE):
+                c = Canvas(
+                    grid_wrap, width=self.CELL_SIZE, height=self.CELL_SIZE,
+                    bg=p.bg_cell_empty, highlightthickness=1,
+                    highlightbackground=p.border, bd=0, cursor="hand2",
+                )
+                c.grid(row=row + 1, column=col + 1, padx=1, pady=1)
+                c.bind(
                     "<Button-1>",
                     lambda _e, x=col, y=row: self._on_cell_click(x, y),
                 )
-                row_cells.append(cell)
-            self.cells.append(row_cells)
-        
-        # Легенда
-        legend_frame = Frame(self.window, bg=self.colors['panel'])
-        legend_frame.pack(fill=X, padx=10, pady=10)
-        
-        legend_title = Label(legend_frame, text="📖 ЛЕГЕНДА",
-                            bg=self.colors['panel'], fg=self.colors['accent4'],
-                            font=('Arial', 11, 'bold'))
-        legend_title.pack(anchor=W, padx=10, pady=5)
-        
-        # Создаем сетку для легенды
-        legend_grid = Frame(legend_frame, bg=self.colors['panel'])
-        legend_grid.pack(fill=X, padx=10)
-        
-        # Ваши корабли
-        your_frame = Frame(legend_grid, bg=self.colors['panel'])
-        your_frame.grid(row=0, column=0, sticky=W, padx=20, pady=2)
-        
-        your_dot = Label(your_frame, text="■", bg=self.colors['panel'],
-                        fg=self.team_color, font=('Arial', 14))
-        your_dot.pack(side=LEFT)
-        Label(your_frame, text="Ваш корабль", bg=self.colors['panel'],
-             fg='white').pack(side=LEFT, padx=5)
-        
-        # Крейсер
-        cruiser_frame = Frame(legend_grid, bg=self.colors['panel'])
-        cruiser_frame.grid(row=0, column=1, sticky=W, padx=20, pady=2)
-        
-        Label(cruiser_frame, text="К", bg='green', fg='white',
-             font=('Arial', 10, 'bold'), width=2).pack(side=LEFT)
-        Label(cruiser_frame, text="Крейсер", bg=self.colors['panel'],
-             fg='white').pack(side=LEFT, padx=5)
-        
-        # Артиллерия
-        art_frame = Frame(legend_grid, bg=self.colors['panel'])
-        art_frame.grid(row=1, column=0, sticky=W, padx=20, pady=2)
-        
-        Label(art_frame, text="А", bg='green', fg='white',
-             font=('Arial', 10, 'bold'), width=2).pack(side=LEFT)
-        Label(art_frame, text="Артиллерия", bg=self.colors['panel'],
-             fg='white').pack(side=LEFT, padx=5)
-        
-        # Радиовышка
-        radio_frame = Frame(legend_grid, bg=self.colors['panel'])
-        radio_frame.grid(row=1, column=1, sticky=W, padx=20, pady=2)
-        
-        Label(radio_frame, text="Р", bg='green', fg='white',
-             font=('Arial', 10, 'bold'), width=2).pack(side=LEFT)
-        Label(radio_frame, text="Радиовышка", bg=self.colors['panel'],
-             fg='white').pack(side=LEFT, padx=5)
-        
-        # Враги
-        enemy_frame = Frame(legend_grid, bg=self.colors['panel'])
-        enemy_frame.grid(row=2, column=0, sticky=W, padx=20, pady=2)
-        
-        enemy_dot = Label(enemy_frame, text="■", bg=self.colors['panel'],
-                         fg='red', font=('Arial', 14))
-        enemy_dot.pack(side=LEFT)
-        Label(enemy_frame, text="Враг", bg=self.colors['panel'],
-             fg='white').pack(side=LEFT, padx=5)
-        
-        # Попадания
-        hit_frame = Frame(legend_grid, bg=self.colors['panel'])
-        hit_frame.grid(row=2, column=1, sticky=W, padx=20, pady=2)
-        
-        Label(hit_frame, text="2", bg='orange', fg='black',
-             font=('Arial', 10, 'bold'), width=2).pack(side=LEFT)
-        Label(hit_frame, text="Попадания", bg=self.colors['panel'],
-             fg='white').pack(side=LEFT, padx=5)
-        
-        # Статусная строка
-        self.status_label = Label(self.window,
-                                  text="🗺️ Карта загружается...",
-                                  bg=self.colors['bg2'], fg=self.colors['accent1'],
-                                  font=('Arial', 10), anchor=W)
-        self.status_label.pack(fill=X, padx=10, pady=5)
-        
-        # Привязываем обновление к слайдеру
-        self.current_layer.trace('w', self.update_map)
-        
-    def update_map(self, *args):
-        """Обновляет отображение карты для текущего слоя"""
-        layer = self.current_layer.get()
-        self.layer_label.config(text=f"Z = {layer}")
-
-        # Очищаем карту (в т.ч. рамки от прошлой подсветки).
-        for row in range(10):
-            for col in range(10):
-                self.cells[row][col].config(
-                    text=" ",
-                    bg=self.colors['bg2'],
-                    fg="white",
-                    highlightthickness=0,
-                    borderwidth=2,
-                    relief=RAISED,
-                )
-        
-        # Отображаем свои корабли
-        your_ships_count = 0
-        radio_ships_on_layer = []
-        
-        for ship_id, ship in self.ships_data.items():
-            if ship['alive'] and ship['z'] == layer:
-                x, y = ship['x'], ship['y']
-                
-                # Определяем символ для типа корабля
-                ship_type = ship.get('type', 'Базовый')
-                if ship['hits'] > 0:
-                    # Если есть попадания, показываем их
-                    bg_color = 'orange'
-                    display_text = str(ship['hits'])
-                else:
-                    bg_color = self.team_color
-                    if ship_type == 'Крейсер':
-                        display_text = "К"
-                    elif ship_type == 'Артиллерия':
-                        display_text = "А"
-                    elif ship_type == 'Радиовышка':
-                        display_text = "Р"
-                        radio_ships_on_layer.append(ship)
-                    else:
-                        display_text = "Б"
-                
-                self.cells[y][x].config(
-                    text=display_text,
-                    bg=bg_color,
-                    fg='white',
-                    font=('Arial', 10, 'bold')
-                )
-                your_ships_count += 1
-        
-        # Отображаем вражеские корабли
-        enemy_ships_count = 0
-        for ship_id, ship in self.enemies_data.items():
-            if ship['alive'] and ship['z'] == layer:
-                x, y = ship['x'], ship['y']
-                
-                # Определяем цвет команды врага
-                if ship['team'] == 'Team A':
-                    enemy_color = '#4169E1'  # Синий
-                elif ship['team'] == 'Team B':
-                    enemy_color = '#DC143C'  # Красный
-                else:
-                    enemy_color = '#228B22'  # Зелёный
-                
-                # Если есть попадания
-                if ship['hits'] > 0:
-                    bg_color = 'orange'
-                    display_text = str(ship['hits'])
-                else:
-                    bg_color = enemy_color
-                    ship_type = ship.get('type', 'Базовый')
-                    if ship_type == 'Крейсер':
-                        display_text = "К"
-                    elif ship_type == 'Артиллерия':
-                        display_text = "А"
-                    elif ship_type == 'Радиовышка':
-                        display_text = "Р"
-                    else:
-                        display_text = "Б"
-                
-                self.cells[y][x].config(
-                    text=display_text,
-                    bg=bg_color,
-                    fg='white',
-                    font=('Arial', 10, 'bold')
-                )
-                enemy_ships_count += 1
-        
-        # Поверх кораблей — рамка для легальных клеток (подсветка хода /
-        # линии огня) и для уже выбранной цели. Это позволяет игроку видеть,
-        # куда корабль может пойти или куда можно выстрелить.
-        if self._legal_cells:
-            legal_color = (
-                '#ffd700' if self._targeting_mode == 'shoot'
-                else '#6bff6b'
-            )
-            for (lx, ly, lz) in self._legal_cells:
-                if lz == layer and 0 <= lx < 10 and 0 <= ly < 10:
-                    self.cells[ly][lx].config(
-                        highlightthickness=3,
-                        highlightbackground=legal_color,
-                        highlightcolor=legal_color,
-                    )
-        if self._selected_target is not None:
-            sx, sy, sz = self._selected_target
-            if sz == layer and 0 <= sx < 10 and 0 <= sy < 10:
-                self.cells[sy][sx].config(
-                    highlightthickness=4,
-                    highlightbackground='#ffffff',
-                    highlightcolor='#ffffff',
+                self._cells[(col, row)] = c
+                # Tooltip — ленивое получение текста при показе.
+                self._cell_tooltip_objs[(col, row)] = Tooltip(
+                    c,
+                    (lambda cx=col, cy=row:
+                     self._cell_tooltip_text.get((cx, cy))),
                 )
 
-        # Обновляем статус
-        status_text = f"📍 Слой Z={layer} | 🚀 Ваших: {your_ships_count} | 🎯 Врагов: {enemy_ships_count}"
-        if radio_ships_on_layer:
-            status_text += " | 📡 Радиовышка сканирует слой!"
-        if self._targeting_mode == 'move':
-            status_text += "  |  🚀 Выберите клетку для хода"
-        elif self._targeting_mode == 'shoot':
-            status_text += "  |  🎯 Выберите клетку для выстрела"
+        # Легенда (все 10 типов, компактно, в 2 строки).
+        legend = Frame(self.window, bg=p.bg_panel)
+        legend.pack(fill=X, padx=10, pady=(6, 2))
+        Label(
+            legend, text="Легенда:", bg=p.bg_panel, fg=p.accent_warning,
+            font=f.small_bold,
+        ).pack(side=LEFT, padx=(10, 8))
+        legend_grid = Frame(legend, bg=p.bg_panel)
+        legend_grid.pack(side=LEFT, fill=X, expand=True, pady=4)
+        items = list(SHIP_TYPE_INFO.items())
+        # Базовый не используется в advanced-режиме: показываем все типы, но
+        # сохраняем компактную сетку 5×2.
+        cols_per_row = 5
+        for idx, (tname, info) in enumerate(items):
+            r, c = divmod(idx, cols_per_row)
+            cell = Frame(legend_grid, bg=p.bg_panel)
+            cell.grid(row=r, column=c, sticky=W, padx=(4, 14), pady=2)
+            Label(
+                cell, text=info["icon"], bg=p.bg_panel,
+                fg=info["accent"], font=f.body_bold, width=2,
+            ).pack(side=LEFT)
+            Label(
+                cell, text=tname, bg=p.bg_panel, fg=p.fg_primary,
+                font=f.small,
+            ).pack(side=LEFT)
 
-        self.status_label.config(text=status_text)
+        # Статусная строка.
+        self.status_label = Label(
+            self.window, text="Карта загружается…",
+            bg=p.bg_panel, fg=p.accent_info, font=f.small, anchor=W,
+        )
+        self.status_label.pack(fill=X, padx=10, pady=(2, 8))
 
-    def _on_cell_click(self, x, y):
-        """Клик по клетке. Пробрасывается в GUI родителя, если задан."""
-        if self.gui is None:
-            return
-        self.gui.on_map_click(x, y, self.current_layer.get())
+    # ------------------------------------------------------------- render ---
+
+    def _on_layer_change(self, *_args):
+        self.update_map()
+
+    def update_data(self, ships_data, enemies_data):
+        self.ships_data = ships_data or {}
+        self.enemies_data = enemies_data or {}
+        self.update_map()
 
     def set_targeting(self, legal_cells=None, selected=None, mode=None):
-        """Установить подсветку легальных клеток/выбранной цели."""
         self._legal_cells = set(legal_cells) if legal_cells else set()
         self._selected_target = selected
         self._targeting_mode = mode
-        # Если выбранная цель на другом слое — прыгнем туда, чтобы её видеть.
         if selected is not None:
             _, _, sz = selected
             if int(self.current_layer.get()) != sz:
                 self.current_layer.set(sz)
-                return  # trace вызовет update_map сам
+                return
         self.update_map()
 
     def clear_targeting(self):
         self.set_targeting(None, None, None)
 
-    def update_data(self, ships_data, enemies_data):
-        """Обновляет данные кораблей"""
-        self.ships_data = ships_data
-        self.enemies_data = enemies_data
-        self.update_map()
+    def _on_cell_click(self, x, y):
+        if self.gui is None:
+            return
+        self.gui.on_map_click(x, y, self.current_layer.get())
+
+    def _cell_for(self, x, y):
+        return self._cells[(x, y)]
+
+    def update_map(self, *_args):
+        layer = int(self.current_layer.get())
+        self.layer_label.config(text=f"Z = {layer}")
+        p = self.palette
+        # Сброс содержимого и фона всех клеток.
+        for (x, y), c in self._cells.items():
+            c.delete("all")
+            c.configure(
+                bg=p.bg_cell_empty,
+                highlightthickness=1,
+                highlightbackground=p.border,
+            )
+            self._cell_tooltip_text[(x, y)] = None
+
+        # Рисуем корабли союзной команды.
+        my_count, my_radio = 0, []
+        for _sid, ship in (self.ships_data or {}).items():
+            if not ship.get("alive", False):
+                continue
+            if ship.get("z") != layer:
+                continue
+            self._draw_ship(ship, friendly=True)
+            my_count += 1
+            if ship.get("type") == "Радиовышка":
+                my_radio.append(ship)
+
+        # Вражеские корабли.
+        enemy_count = 0
+        for _sid, ship in (self.enemies_data or {}).items():
+            if not ship.get("alive", False):
+                continue
+            if ship.get("z") != layer:
+                continue
+            self._draw_ship(ship, friendly=False)
+            enemy_count += 1
+
+        # Легальные клетки и выбранная цель.
+        if self._legal_cells:
+            legal_bg = (
+                p.bg_cell_legal_shoot if self._targeting_mode == "shoot"
+                else p.bg_cell_legal_move
+            )
+            legal_border = (
+                p.accent_warning if self._targeting_mode == "shoot"
+                else p.accent_success
+            )
+            for (lx, ly, lz) in self._legal_cells:
+                if lz != layer or not (0 <= lx < 10 and 0 <= ly < 10):
+                    continue
+                c = self._cells[(lx, ly)]
+                # Не затираем отрисованный корабль; только рамку.
+                has_ship = bool(self._cell_tooltip_text.get((lx, ly)))
+                if not has_ship:
+                    c.configure(bg=legal_bg)
+                c.configure(
+                    highlightthickness=2,
+                    highlightbackground=legal_border,
+                )
+        if self._selected_target is not None:
+            sx, sy, sz = self._selected_target
+            if sz == layer and 0 <= sx < 10 and 0 <= sy < 10:
+                self._cells[(sx, sy)].configure(
+                    highlightthickness=3,
+                    highlightbackground=p.fg_title,
+                )
+
+        # Z-миникарта: по каждому слою Z считаем своих/врагов и рисуем.
+        self._update_zcolumn(layer)
+
+        # Статус.
+        status_bits = [
+            f"Слой Z={layer}",
+            f"Свои: {my_count}",
+            f"Врагов: {enemy_count}",
+        ]
+        if my_radio:
+            status_bits.append("📡 Радиовышка сканирует слой")
+        if self._targeting_mode == "move":
+            status_bits.append("🚀 Кликните клетку для хода")
+        elif self._targeting_mode == "shoot":
+            status_bits.append("🎯 Кликните клетку для атаки")
+        self.status_label.config(text="   •   ".join(status_bits))
+
+    def _update_zcolumn(self, active_layer):
+        p = self.palette
+        per_layer_mine = [0] * 10
+        per_layer_enemy = [0] * 10
+        for ship in (self.ships_data or {}).values():
+            if ship.get("alive"):
+                z = ship.get("z")
+                if isinstance(z, int) and 0 <= z <= 9:
+                    per_layer_mine[z] += 1
+        for ship in (self.enemies_data or {}).values():
+            if ship.get("alive"):
+                z = ship.get("z")
+                if isinstance(z, int) and 0 <= z <= 9:
+                    per_layer_enemy[z] += 1
+        for z, (marker, bar) in self._z_columns.items():
+            marker.delete("all")
+            if z == active_layer:
+                marker.create_polygon(
+                    (2, 2, 12, 7, 2, 12),
+                    fill=p.accent_info, outline="",
+                )
+            bar.delete("all")
+            # Рисуем две полоски: свои (слева), враги (справа).
+            mine = per_layer_mine[z]
+            enemy = per_layer_enemy[z]
+            # Нормируем на 8 кораблей (максимум в команде).
+            my_len = min(mine, 8) * 5
+            en_len = min(enemy, 8) * 5
+            if my_len > 0:
+                bar.create_rectangle(
+                    0, 2, my_len, 6, fill=self.team_color, outline="",
+                )
+            if en_len > 0:
+                bar.create_rectangle(
+                    0, 8, en_len, 12, fill=p.accent_danger, outline="",
+                )
+            if mine or enemy:
+                bar.create_text(
+                    60, 7, text=f"{mine}/{enemy}",
+                    fill=p.fg_secondary, font=self.fonts.small, anchor=W,
+                )
+
+    def _draw_ship(self, ship, friendly: bool):
+        """Рисует содержимое одной клетки для корабля.
+
+        Композиция:
+          1) Фоновая плашка (цвет команды-хозяина; для «своих» — self.team_color).
+          2) Крупная иконка типа (эмодзи) в центре.
+          3) HP-бар внизу (цвет от hp_color).
+          4) Маркер фазы (шестиугольная рамка) или фокуса (круг) при состоянии.
+
+        Дополнительно: сохраняет в _cell_tooltip_text строку для подсказки.
+        """
+        p = self.palette
+        x, y = ship["x"], ship["y"]
+        if (x, y) not in self._cells:
+            return
+        c = self._cells[(x, y)]
+        size = self.CELL_SIZE
+
+        ship_type = ship.get("type") or ship.get("ship_type") or "Базовый"
+        team = ship.get("team", "")
+        info = SHIP_TYPE_INFO.get(ship_type, {})
+        icon = info.get("icon", "🛰")
+        base_color = (
+            self.team_color if friendly
+            else TEAM_COLORS.get(team, p.accent_danger)
+        )
+
+        # Фон клетки: тонированный цвет команды + рамка.
+        c.configure(bg=self._tint(base_color))
+        # Основная «подложка» корабля — круг в центре с окантовкой цвета команды.
+        margin = 4
+        c.create_rectangle(
+            margin, margin, size - margin, size - margin,
+            fill=p.bg_card, outline=base_color, width=2,
+        )
+        # Иконка типа.
+        c.create_text(
+            size / 2, size / 2 - 3,
+            text=icon, fill=base_color,
+            font=self.fonts.cell_icon,
+        )
+
+        # Короткая буква в углу (для надёжной читаемости).
+        c.create_text(
+            8, 10, text=ship_short(ship_type),
+            fill=p.fg_primary, font=self.fonts.small_bold, anchor=W,
+        )
+
+        # HP-бар внизу. hits = число попаданий, hp = max_hits - hits.
+        max_hits = int(ship.get("max_hits") or 1)
+        hits = int(ship.get("hits") or 0)
+        hp = max(0, max_hits - hits)
+        bar_y = size - 10
+        bar_x0, bar_x1 = 6, size - 6
+        c.create_rectangle(
+            bar_x0, bar_y, bar_x1, bar_y + 4,
+            fill=p.bg_root, outline="",
+        )
+        if max_hits > 0 and hp > 0:
+            pct = hp / max_hits
+            filled = bar_x0 + int((bar_x1 - bar_x0) * pct)
+            c.create_rectangle(
+                bar_x0, bar_y, filled, bar_y + 4,
+                fill=hp_color(hp, max_hits, p), outline="",
+            )
+
+        # Фаза.
+        if ship.get("is_phased"):
+            c.create_oval(
+                2, 2, size - 2, size - 2,
+                outline=p.accent_phase, width=2, dash=(4, 2),
+            )
+
+        # Tooltip.
+        lines = [
+            f"{icon}  {ship_type}  ({ship.get('name', ship.get('id', '?'))})",
+            f"Команда: {team}" if team else None,
+            f"HP: {hp}/{max_hits}",
+        ]
+        extras = []
+        if ship.get("jump_range"):
+            extras.append(f"jump {ship['jump_range']}")
+        if ship.get("drill_range"):
+            extras.append(f"drill {ship['drill_range']}")
+        if ship.get("heal_range"):
+            extras.append(f"heal {ship['heal_range']}")
+        if ship.get("shoot_range") and ship.get("can_shoot"):
+            extras.append(f"shoot {ship['shoot_range']}")
+        if ship.get("move_range"):
+            extras.append(f"move {ship['move_range']}")
+        if extras:
+            lines.append("Дальности: " + ", ".join(extras))
+        if ship.get("is_phased"):
+            lines.append("⚡ Фаза активна (неуязвим 1 ход)")
+        pc = ship.get("phase_cooldown") or 0
+        if pc:
+            lines.append(f"⏳ PHASE cooldown: {pc}")
+        role = ship_role(ship_type)
+        if role:
+            lines.append(f"Роль: {role}")
+        self._cell_tooltip_text[(x, y)] = "\n".join(
+            line for line in lines if line
+        )
+
+    @staticmethod
+    def _tint(hex_color: str, alpha: float = 0.25) -> str:
+        """Смешивает цвет с тёмным фоном для «приглушённой» плашки клетки."""
+        try:
+            h = hex_color.lstrip("#")
+            r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        except Exception:
+            return hex_color
+        # Фон под тонировку — bg_cell_empty.
+        bg = (0x16, 0x20, 0x4a)
+        nr = int(r * alpha + bg[0] * (1 - alpha))
+        ng = int(g * alpha + bg[1] * (1 - alpha))
+        nb = int(b * alpha + bg[2] * (1 - alpha))
+        return f"#{nr:02x}{ng:02x}{nb:02x}"
 
 class GameClientGUI:
     def __init__(self):
