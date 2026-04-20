@@ -674,51 +674,104 @@ class GameClientGUI:
         self.create_button_panel()
     
     def create_info_panel(self):
-        """Панель с информацией о ходе"""
-        info_frame = LabelFrame(self.root, text="📊 ИНФОРМАЦИЯ О ХОДЕ",
-                                bg=self.colors['panel'], fg=self.colors['accent1'],
-                                font=('Arial', 12, 'bold'))
-        info_frame.pack(fill=X, padx=10, pady=5)
-        
-        # Создаем сетку для информации
-        info_grid = Frame(info_frame, bg=self.colors['panel'])
-        info_grid.pack(fill=X, padx=10, pady=10)
-        
-        # Ход
-        Label(info_grid, text="Текущий ход:", bg=self.colors['panel'],
-              fg=self.colors['text']).grid(row=0, column=0, sticky=W, padx=5)
-        self.turn_label = Label(info_grid, text="0", bg=self.colors['panel'],
-                                fg=self.colors['accent4'], font=('Arial', 12, 'bold'))
-        self.turn_label.grid(row=0, column=1, sticky=W, padx=10)
-        
-        # Фаза
-        Label(info_grid, text="Фаза игры:", bg=self.colors['panel'],
-              fg=self.colors['text']).grid(row=0, column=2, sticky=W, padx=20)
-        self.phase_label = Label(info_grid, text="ожидание", bg=self.colors['panel'],
-                                 fg='orange', font=('Arial', 12, 'bold'))
-        self.phase_label.grid(row=0, column=3, sticky=W, padx=10)
-        
-        # Команда
-        Label(info_grid, text="Ваша команда:", bg=self.colors['panel'],
-              fg=self.colors['text']).grid(row=1, column=0, sticky=W, padx=5, pady=5)
-        self.team_label = Label(info_grid, text="Не выбрана", bg=self.colors['panel'],
-                                fg='red', font=('Arial', 11, 'bold'))
-        self.team_label.grid(row=1, column=1, sticky=W, padx=10)
-        
-        # Игрок
-        Label(info_grid, text="Имя игрока:", bg=self.colors['panel'],
-              fg=self.colors['text']).grid(row=1, column=2, sticky=W, padx=20)
-        self.player_label = Label(info_grid, text="Неизвестный", bg=self.colors['panel'],
-                                   fg=self.colors['accent1'], font=('Arial', 11, 'bold'))
-        self.player_label.grid(row=1, column=3, sticky=W, padx=10)
-        
-        # Примечание о видимости
-        note_frame = Frame(info_frame, bg=self.colors['panel'])
-        note_frame.pack(fill=X, padx=10, pady=5)
-        
-        note_text = "👁️ Враги видны: в радиусе 3 клеток + вся плоскость Z от радиовышки"
-        Label(note_frame, text=note_text, bg=self.colors['panel'],
-              fg=self.colors['accent3'], font=('Arial', 9)).pack()
+        """HUD-панель: ход, фаза, плашки команд (живые/урон/киллы)."""
+        pal = Palette()
+        fnt = Fonts()
+
+        hud = Frame(self.root, bg=pal.bg_panel, bd=1, relief=FLAT)
+        hud.pack(fill=X, padx=10, pady=(0, 6))
+
+        # --- Левая секция: ход + фаза + команда/игрок ------------------- #
+        left = Frame(hud, bg=pal.bg_panel)
+        left.pack(side=LEFT, fill=Y, padx=10, pady=8)
+
+        Label(left, text="ХОД", bg=pal.bg_panel, fg=pal.fg_secondary,
+              font=fnt.small).grid(row=0, column=0, sticky=W)
+        self.turn_label = Label(
+            left, text="0", bg=pal.bg_panel, fg=pal.accent_info, font=fnt.h1,
+        )
+        self.turn_label.grid(row=1, column=0, sticky=W, padx=(0, 2))
+        self.turn_limit_label = Label(
+            left, text="/30", bg=pal.bg_panel, fg=pal.fg_muted, font=fnt.h3,
+        )
+        self.turn_limit_label.grid(row=1, column=1, sticky=SW, pady=(0, 4))
+
+        Label(left, text="ФАЗА", bg=pal.bg_panel, fg=pal.fg_secondary,
+              font=fnt.small).grid(row=0, column=2, sticky=W, padx=(16, 0))
+        self.phase_label = Label(
+            left, text="ожидание", bg=pal.bg_panel, fg=pal.accent_warning,
+            font=fnt.body_bold,
+        )
+        self.phase_label.grid(row=1, column=2, sticky=W, padx=(16, 0))
+
+        Label(left, text="ВЫ", bg=pal.bg_panel, fg=pal.fg_secondary,
+              font=fnt.small).grid(row=0, column=3, sticky=W, padx=(16, 0))
+        self.team_label = Label(
+            left, text="—", bg=pal.bg_panel, fg=pal.fg_primary,
+            font=fnt.body_bold,
+        )
+        self.team_label.grid(row=1, column=3, sticky=W, padx=(16, 0))
+        self.player_label = Label(
+            left, text="", bg=pal.bg_panel, fg=pal.fg_muted, font=fnt.small,
+        )
+        self.player_label.grid(row=2, column=3, sticky=W, padx=(16, 0))
+
+        # --- Правая секция: плашки 3 команд ---------------------------- #
+        right = Frame(hud, bg=pal.bg_panel)
+        right.pack(side=RIGHT, fill=Y, padx=10, pady=6)
+
+        self._team_pill_widgets = {}
+        for i, team_name in enumerate(("Team A", "Team B", "Team C")):
+            pill = Frame(right, bg=pal.bg_card, bd=1, relief=FLAT)
+            pill.grid(row=0, column=i, padx=4, pady=2, sticky=NS)
+            color = TEAM_COLORS.get(team_name, pal.fg_primary)
+            # Цветная полоска слева от плашки.
+            stripe = Frame(pill, bg=color, width=4)
+            stripe.pack(side=LEFT, fill=Y)
+            body = Frame(pill, bg=pal.bg_card)
+            body.pack(side=LEFT, fill=BOTH, expand=True, padx=8, pady=4)
+
+            name_lbl = Label(
+                body, text=team_name, bg=pal.bg_card, fg=color,
+                font=fnt.body_bold,
+            )
+            name_lbl.grid(row=0, column=0, columnspan=3, sticky=W)
+
+            alive_lbl = Label(
+                body, text="—/—", bg=pal.bg_card, fg=pal.fg_primary,
+                font=fnt.body_bold,
+            )
+            alive_lbl.grid(row=1, column=0, sticky=W, padx=(0, 10))
+            dmg_lbl = Label(
+                body, text="⚡0", bg=pal.bg_card, fg=pal.accent_warning,
+                font=fnt.small_bold,
+            )
+            dmg_lbl.grid(row=1, column=1, sticky=W, padx=(0, 8))
+            kill_lbl = Label(
+                body, text="✖0", bg=pal.bg_card, fg=pal.accent_danger,
+                font=fnt.small_bold,
+            )
+            kill_lbl.grid(row=1, column=2, sticky=W)
+
+            Label(body, text="живых", bg=pal.bg_card, fg=pal.fg_muted,
+                  font=fnt.small).grid(row=2, column=0, sticky=W)
+            Label(body, text="урон", bg=pal.bg_card, fg=pal.fg_muted,
+                  font=fnt.small).grid(row=2, column=1, sticky=W)
+            Label(body, text="киллы", bg=pal.bg_card, fg=pal.fg_muted,
+                  font=fnt.small).grid(row=2, column=2, sticky=W)
+
+            self._team_pill_widgets[team_name] = {
+                "frame": pill, "name": name_lbl,
+                "alive": alive_lbl, "dmg": dmg_lbl, "kill": kill_lbl,
+            }
+
+        # Подсказка по видимости (маленькой подписью).
+        note = Label(
+            hud,
+            text="👁 Радиус обзора 4 · Радиовышка видит всю свою Z-плоскость",
+            bg=pal.bg_panel, fg=pal.fg_muted, font=fnt.small,
+        )
+        note.pack(side=BOTTOM, fill=X, padx=10, pady=(0, 4))
     
     # ------------------------------------------------------------------ #
     #  Карточки кораблей (Task 2)
@@ -1373,8 +1426,69 @@ class GameClientGUI:
         # Журнал попаданий (cumulative за всю партию).
         self.update_history(state.get('hit_history', []))
 
+        # Плашки команд в HUD.
+        self._update_team_pills(state)
+
         # Визуальный таймер фазы планирования — приходит через poll_timer().
         self._render_timer_from_state(state)
+
+    def _update_team_pills(self, state):
+        """Обновляет плашки команд в HUD по данным state."""
+        if not hasattr(self, "_team_pill_widgets"):
+            return
+        pal = Palette()
+
+        my_team = state.get("team", "")
+        my_ships = state.get("my_ships", {}) or {}
+        vis_enemies = state.get("visible_enemies", {}) or {}
+        history = state.get("hit_history", []) or []
+
+        # Считаем урон и киллы по атакующим командам из hit_history.
+        dmg_by = {"Team A": 0, "Team B": 0, "Team C": 0}
+        kill_by = {"Team A": 0, "Team B": 0, "Team C": 0}
+        for ev in history:
+            atk = ev.get("attacker") or ev.get("owner")  # мина/голо — owner.
+            dmg = ev.get("damage") or 0
+            if atk in dmg_by:
+                dmg_by[atk] += dmg
+                if ev.get("killed"):
+                    kill_by[atk] += 1
+
+        # Живые по командам: свою знаем, чужие — только по visible_enemies
+        # (+ сколько уже гарантированно убито из kill_by).
+        alive_my = sum(1 for s in my_ships.values() if s.get("alive"))
+        total_my = len(my_ships) if my_ships else 8
+
+        enemy_alive_seen = {"Team A": 0, "Team B": 0, "Team C": 0}
+        for s in vis_enemies.values():
+            if s.get("alive"):
+                t = s.get("team")
+                if t in enemy_alive_seen:
+                    enemy_alive_seen[t] += 1
+
+        for team_name, widgets in self._team_pill_widgets.items():
+            color = TEAM_COLORS.get(team_name, pal.fg_primary)
+            if team_name == my_team:
+                widgets["alive"].config(text=f"{alive_my}/{total_my}",
+                                        fg=color)
+            else:
+                seen = enemy_alive_seen.get(team_name, 0)
+                # Нижняя оценка: видим `seen`, и убитые (не путать с видимыми
+                # вражескими живыми) учтены как убитые.
+                widgets["alive"].config(
+                    text=f"{seen}+?", fg=pal.fg_primary,
+                )
+            widgets["dmg"].config(text=f"⚡{dmg_by.get(team_name, 0)}")
+            widgets["kill"].config(text=f"✖{kill_by.get(team_name, 0)}")
+
+            # Подсветка своей команды: сделаем имя ярче.
+            if team_name == my_team:
+                widgets["name"].config(fg=color, font=Fonts().body_bold)
+                widgets["frame"].config(
+                    highlightbackground=color, highlightthickness=2,
+                )
+            else:
+                widgets["frame"].config(highlightthickness=0)
     
     def update_ships_list(self, state):
         """Обновляет карточки своих кораблей."""

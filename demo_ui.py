@@ -158,6 +158,53 @@ def _demo_history():
     ]
 
 
+def run_hud():
+    """Демо: HUD-панель (ход/фаза/плашки команд)."""
+    root = Tk()
+    apply_theme(root)
+    root.title("demo: HUD")
+    root.configure(bg=Palette().bg_root)
+    root.geometry("980x220")
+
+    class _Mock:
+        colors = {
+            'panel': Palette().bg_panel,
+            'accent1': Palette().accent_info,
+            'accent3': Palette().accent_success,
+            'accent4': Palette().accent_warning,
+            'text': Palette().fg_primary,
+        }
+        root = None
+        create_info_panel = GameClientGUI.create_info_panel
+        _update_team_pills = GameClientGUI._update_team_pills
+
+    m = _Mock()
+    m.root = root
+    m.create_info_panel()
+
+    # Применяем реалистичное состояние: ход 8, фаза планирования,
+    # Team A — наши, противники частично видны, есть история событий.
+    m.turn_label.config(text="8")
+    m.phase_label.config(text="📝 ПЛАНИРОВАНИЕ",
+                         fg=Palette().accent_success)
+    m.team_label.config(text="Team A", fg=TEAM_COLORS["Team A"])
+    m.player_label.config(text="bpyh2706")
+
+    ships, enemies = _demo_ships()
+    # Убьём пару своих, чтобы 6/8.
+    for dead_id in ("0", "7"):
+        if dead_id in ships:
+            ships[dead_id]["alive"] = False
+    state = {
+        "team": "Team A",
+        "my_ships": ships,
+        "visible_enemies": enemies,
+        "hit_history": _demo_history(),
+    }
+    m._update_team_pills(state)
+    root.mainloop()
+
+
 def run_log():
     """Демо: рендер журнала боя."""
     root = Tk()
@@ -193,6 +240,8 @@ if __name__ == "__main__":
         run_cards()
     elif cmd == "log":
         run_log()
+    elif cmd == "hud":
+        run_hud()
     else:
         print(f"unknown demo '{cmd}'", file=sys.stderr)
         sys.exit(2)
