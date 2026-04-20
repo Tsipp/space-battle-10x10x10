@@ -72,7 +72,9 @@ class Ship:
         self.mine_damage = 0
 
         if ship_type == ShipType.CRUISER:
-            self.max_hits = 1
+            # Баланс v2: hp 1→2, чтобы крейсер не сносился с одного залпа
+            # другого крейсера/артиллерии (damage=2).
+            self.max_hits = 2
             self.move_range = 1
             self.can_shoot = True
             self.shoot_range = 5
@@ -80,7 +82,9 @@ class Ship:
             self.damage = 2
 
         elif ship_type == ShipType.ARTILLERY:
-            self.max_hits = 3
+            # Баланс v2: hp 3→1. Артиллерия стреляет куда угодно и наносит 2
+            # урона — даём ей «стекло» как цену мобильности=0.
+            self.max_hits = 1
             self.move_range = 0  # Артиллерия не двигается
             self.can_shoot = True
             self.shoot_range = 10  # Вся карта (макс 10 клеток)
@@ -108,9 +112,10 @@ class Ship:
             self.damage = 1
 
         elif ship_type == ShipType.TORCH:
-            # Факел: hp=5, лечит союзников в радиусе 1,
-            # move=1, атака 1. Главный корабль.
-            self.max_hits = 5
+            # Факел: hp=6 (баланс v2, было 5), лечит союзников в радиусе 1,
+            # move=1, атака 1. Главный корабль-саппорт — держим его живым
+            # дольше, иначе в прошлых прогонах он получал dmg 367 против 47.
+            self.max_hits = 6
             self.move_range = 1
             self.heal_range = 1
             self.can_shoot = True

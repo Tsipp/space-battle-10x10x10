@@ -22,7 +22,8 @@ class TestShipDefaults:
 
     def test_cruiser(self):
         s = make(ship_type=ShipType.CRUISER)
-        assert s.max_hits == 1
+        # Баланс v2: hp 1→2.
+        assert s.max_hits == 2
         assert s.move_range == 1
         assert s.shoot_range == 5
         assert s.can_shoot is True
@@ -30,7 +31,8 @@ class TestShipDefaults:
 
     def test_artillery(self):
         s = make(ship_type=ShipType.ARTILLERY)
-        assert s.max_hits == 3
+        # Баланс v2: hp 3→1 (glass cannon).
+        assert s.max_hits == 1
         assert s.move_range == 0
         assert s.shoot_range == 10
         assert s.shoot_anywhere is True
@@ -64,7 +66,8 @@ class TestNewShipTypes:
 
     def test_torch(self):
         s = make(ship_type=ShipType.TORCH)
-        assert s.max_hits == 5
+        # Баланс v2: hp 5→6.
+        assert s.max_hits == 6
         assert s.move_range == 1
         assert s.heal_range == 1
         assert s.damage == 1
@@ -161,7 +164,10 @@ class TestCanShootAt:
 
 class TestHits:
     def test_take_hit_reduces_alive(self):
+        # Крейсер теперь hp=2 (баланс v2): одного попадания недостаточно.
         s = make(ship_type=ShipType.CRUISER)
+        assert s.alive
+        s.take_hit()
         assert s.alive
         s.take_hit()
         assert not s.alive
@@ -173,10 +179,9 @@ class TestHits:
         s.take_hit()
         assert not s.alive
 
-    def test_artillery_takes_three_hits(self):
+    def test_artillery_takes_one_hit(self):
+        # Баланс v2: артиллерия hp=1, умирает с одного попадания.
         s = make(ship_type=ShipType.ARTILLERY)
-        s.take_hit()
-        s.take_hit()
         assert s.alive
         s.take_hit()
         assert not s.alive

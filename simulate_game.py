@@ -99,6 +99,10 @@ class TeamBot:
     def __init__(self, team: Team, rng: random.Random):
         self.team = team
         self.rng = rng
+        # Память о последних видимых врагах: id -> (x, y, z, turns_since_seen).
+        # Используется, в частности, артиллерией для «слепого» выстрела
+        # по предполагаемым клеткам, когда никого не видно в этот ход.
+        self.last_known_enemies: dict[str, tuple[int, int, int, int]] = {}
 
     def decide(self, server: GameServer) -> list[Action]:
         ships = server.game_state['ships']
@@ -108,14 +112,37 @@ class TeamBot:
         # Преобразуем обратно из dict в объекты, чтобы оперировать позициями.
         visible_ships = [ships[sid] for sid in visible.keys() if sid in ships]
 
+        # Обновляем память о позициях врагов: видимых — на «0 ходов назад»,
+        # всем остальным запомненным — прибавляем +1 к «свежести».
+        for eid in list(self.last_known_enemies.keys()):
+            x, y, z, age = self.last_known_enemies[eid]
+            self.last_known_enemies[eid] = (x, y, z, age + 1)
+        for e in visible_ships:
+            self.last_known_enemies[e.id] = (e.x, e.y, e.z, 0)
+        # Удаляем «мёртвые» и слишком старые записи.
+        for eid in list(self.last_known_enemies.keys()):
+            s = ships.get(eid)
+            if s is None or not s.alive:
+                self.last_known_enemies.pop(eid, None)
+                continue
+            if self.last_known_enemies[eid][3] > 6:
+                self.last_known_enemies.pop(eid, None)
+
         actions: list[Action] = []
         # Зарезервированные целевые клетки для move на этом ходу — чтобы два
         # наших корабля не пытались влезть в одну и ту же клетку (коллизии
         # всё равно отсечёт сервер, но и так красивее).
         reserved_cells: set[tuple[int, int, int]] = {(s.x, s.y, s.z) for s in my_ships}
 
+        # Предсказанные клетки врагов на следующий ход: каждый видимый враг,
+        # скорее всего, сделает 1 шаг в сторону ближайшего НАШЕГО корабля.
+        predicted_enemy_cells = self._predict_enemy_next_cells(visible_ships, my_ships)
+
         for ship in my_ships:
-            action = self._decide_ship(ship, visible_ships, my_ships, reserved_cells)
+            action = self._decide_ship(
+                ship, visible_ships, my_ships, reserved_cells,
+                predicted_enemy_cells, ships,
+            )
             if action is not None:
                 actions.append(action)
                 if action.action_type == ActionType.MOVE:
@@ -123,6 +150,45 @@ class TeamBot:
                         (action.target_x, action.target_y, action.target_z)
                     )
         return actions
+
+    def _predict_enemy_next_cells(
+        self, enemies: list, my_ships: list
+    ) -> dict[tuple[int, int, int], int]:
+        """Грубый прогноз: каждый видимый враг сделает 1 шаг в сторону
+        Chebyshev-ближайшего нашего корабля. Возвращает dict (x,y,z)→вес
+        (сколько врагов метят в эту клетку)."""
+        cells: dict[tuple[int, int, int], int] = {}
+        if not enemies or not my_ships:
+            return cells
+        for e in enemies:
+            # Радиус хода у врага — берём эффективный (jump/drill включены).
+            move_r = max(
+                getattr(e, 'move_range', 0),
+                getattr(e, 'jump_range', 0),
+                getattr(e, 'drill_range', 0),
+            )
+            if move_r <= 0:
+                continue
+            ally = min(
+                my_ships,
+                key=lambda a: max(
+                    abs(a.x - e.x), abs(a.y - e.y), abs(a.z - e.z)
+                ),
+            )
+
+            def _sgn(a, b):
+                return (1 if a < b else (-1 if a > b else 0))
+
+            dx = _sgn(e.x, ally.x)
+            dy = _sgn(e.y, ally.y)
+            dz = _sgn(e.z, ally.z)
+            nx = max(0, min(9, e.x + dx))
+            ny = max(0, min(9, e.y + dy))
+            nz = max(0, min(9, e.z + dz))
+            if (nx, ny, nz) == (e.x, e.y, e.z):
+                continue
+            cells[(nx, ny, nz)] = cells.get((nx, ny, nz), 0) + 1
+        return cells
 
     # --- shoot helpers -------------------------------------------------------
 
@@ -180,7 +246,100 @@ class TeamBot:
             return nx, ny, nz
         return None
 
-    def _decide_ship(self, ship, visible_ships, my_ships, reserved):
+    # --- blind fire helpers --------------------------------------------------
+    #
+    # Стартовые зоны каждой команды — опорные точки для слепого обстрела,
+    # если память ещё не заполнена (первые ходы), но враг уже где-то там.
+    _ENEMY_ZONES: dict[Team, tuple[tuple[int, int, int], ...]] = {
+        Team.TEAM_A: ((0, 0, 0), (0, 5, 0), (0, 0, 1), (0, 5, 1)),
+        Team.TEAM_B: ((9, 9, 9), (9, 4, 9), (9, 9, 8), (9, 4, 8)),
+        Team.TEAM_C: ((4, 9, 4), (7, 9, 4), (4, 9, 5), (7, 9, 5)),
+    }
+
+    def _pick_blind_target(self, ship, my_ships, all_ships):
+        """Выбирает клетку для «слепого» выстрела артиллерии.
+
+        1) Берём из памяти последние замеченные координаты врагов, смещаем
+           их на 1 шаг в сторону наших кораблей (враг за прошедшие ходы
+           скорее всего сдвинулся). Сортируем по «свежести» — чем недавнее
+           видели, тем выше приоритет. Выбираем лучший таргет, который
+           ship.can_shoot_at подтверждает.
+        2) Если память пустая — стреляем по стартовым зонам вражеских
+           команд, выбирая ту клетку, до которой стреляющий дотягивается.
+        Возвращает (x, y, z) или None, если ничего не подошло.
+        """
+        # Собираем центр масс наших кораблей для оценки направления движения врага.
+        if my_ships:
+            cx = sum(a.x for a in my_ships) / len(my_ships)
+            cy = sum(a.y for a in my_ships) / len(my_ships)
+            cz = sum(a.z for a in my_ships) / len(my_ships)
+        else:
+            cx = cy = cz = 4.5
+
+        def _sgn_f(a, b):
+            if a < b - 0.5:
+                return 1
+            if a > b + 0.5:
+                return -1
+            return 0
+
+        candidates: list[tuple[int, int, int, int]] = []  # (age, x, y, z)
+        for eid, (ex, ey, ez, age) in self.last_known_enemies.items():
+            s = all_ships.get(eid) if all_ships else None
+            if s is None or not s.alive:
+                continue
+            # Смещение на 1 шаг в сторону наших, зависит от age — чем старше
+            # запись, тем больше возможный шаг.
+            shift = min(age + 1, 3)
+            dx = _sgn_f(ex, cx) * shift
+            dy = _sgn_f(ey, cy) * shift
+            dz = _sgn_f(ez, cz) * shift
+            tx = max(0, min(9, ex + dx))
+            ty = max(0, min(9, ey + dy))
+            tz = max(0, min(9, ez + dz))
+            candidates.append((age, tx, ty, tz))
+            # Ещё три варианта вокруг базовой клетки — случайный разброс.
+            for _ in range(2):
+                jx = self.rng.randint(-1, 1)
+                jy = self.rng.randint(-1, 1)
+                jz = self.rng.randint(-1, 1)
+                candidates.append((
+                    age,
+                    max(0, min(9, tx + jx)),
+                    max(0, min(9, ty + jy)),
+                    max(0, min(9, tz + jz)),
+                ))
+
+        # Сортируем по «свежести» (age asc).
+        candidates.sort(key=lambda t: t[0])
+        # Не стрелять в свою же клетку.
+        my_cells = {(s.x, s.y, s.z) for s in my_ships}
+
+        for _, tx, ty, tz in candidates:
+            if (tx, ty, tz) in my_cells:
+                continue
+            if ship.can_shoot_at(tx, ty, tz):
+                return (tx, ty, tz)
+
+        # Fallback: стрельба по стартовым зонам других команд.
+        zones: list[tuple[int, int, int]] = []
+        for team, cells in self._ENEMY_ZONES.items():
+            if team != self.team:
+                zones.extend(cells)
+        self.rng.shuffle(zones)
+        for tx, ty, tz in zones:
+            if (tx, ty, tz) in my_cells:
+                continue
+            if ship.can_shoot_at(tx, ty, tz):
+                return (tx, ty, tz)
+        return None
+
+    def _decide_ship(
+        self, ship, visible_ships, my_ships, reserved,
+        predicted_enemy_cells=None, all_ships=None,
+    ):
+        predicted_enemy_cells = predicted_enemy_cells or {}
+        all_ships = all_ships or {}
         # ---- Способности нестандартных кораблей (только в advanced) --------
         # Тишина: вошёл в фазу, если ранен; выходит, когда полностью здоров.
         if getattr(ship, 'can_phase', False):
@@ -226,28 +385,60 @@ class TeamBot:
                         ship.id, ActionType.HOLOGRAM, tx, ty, tz
                     )
 
-        # Паук: ставит мину в клетку между собой и ближайшим врагом.
-        if getattr(ship, 'can_place_mine', False) and visible_ships:
-            nearest = min(
-                visible_ships,
-                key=lambda e: max(
-                    abs(e.x - ship.x), abs(e.y - ship.y), abs(e.z - ship.z)
-                ),
-            )
-            dist = max(
-                abs(nearest.x - ship.x),
-                abs(nearest.y - ship.y),
-                abs(nearest.z - ship.z),
-            )
-            if 1 <= dist <= 4:
-                step = self._step_toward(
-                    ship.x, ship.y, ship.z, nearest.x, nearest.y, nearest.z, reserved
+        # Паук: ставит мину в клетку, куда с максимальной вероятностью
+        # шагнёт вражеский корабль на следующий ход.
+        # Алгоритм: перебираем 26 соседних клеток Паука (Chebyshev≤1), для
+        # каждой берём «вес» из predicted_enemy_cells (сколько врагов
+        # предположительно туда шагнут). Дополнительно фильтруем: клетка
+        # должна быть в границах, пустой (нет нашего корабля, нет
+        # существующей мины/голограммы). Выбираем клетку с максимальным
+        # весом. Если ни одна не совпала с прогнозом — fallback на
+        # step_toward к ближайшему видимому врагу (старая логика).
+        if getattr(ship, 'can_place_mine', False):
+            # Собираем множество клеток, куда ставить нельзя.
+            blocked = {(s.x, s.y, s.z) for s in all_ships.values() if s.alive}
+            # Свои корабли и так в reserved (из decide()) — но мины ставим
+            # только на пустые клетки.
+            best = None
+            best_weight = 0
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for dz in (-1, 0, 1):
+                        if dx == dy == dz == 0:
+                            continue
+                        nx, ny, nz = ship.x + dx, ship.y + dy, ship.z + dz
+                        if not (0 <= nx < 10 and 0 <= ny < 10 and 0 <= nz < 10):
+                            continue
+                        if (nx, ny, nz) in blocked:
+                            continue
+                        w = predicted_enemy_cells.get((nx, ny, nz), 0)
+                        if w > best_weight:
+                            best_weight = w
+                            best = (nx, ny, nz)
+            if best is not None:
+                return Action(ship.id, ActionType.MINE, *best)
+            # Fallback: ставим между нами и ближайшим видимым врагом.
+            if visible_ships:
+                nearest = min(
+                    visible_ships,
+                    key=lambda e: max(
+                        abs(e.x - ship.x), abs(e.y - ship.y), abs(e.z - ship.z)
+                    ),
                 )
-                if step is not None:
-                    tx, ty, tz = step
-                    return Action(
-                        ship.id, ActionType.MINE, tx, ty, tz
+                dist = max(
+                    abs(nearest.x - ship.x),
+                    abs(nearest.y - ship.y),
+                    abs(nearest.z - ship.z),
+                )
+                if 1 <= dist <= 4:
+                    step = self._step_toward(
+                        ship.x, ship.y, ship.z, nearest.x, nearest.y, nearest.z, reserved
                     )
+                    if step is not None:
+                        tx, ty, tz = step
+                        return Action(
+                            ship.id, ActionType.MINE, tx, ty, tz
+                        )
 
         # Прыгун: если видит врага в радиусе jump_range — прыгает и убивает
         # его тараном.
@@ -292,6 +483,28 @@ class TeamBot:
                 action_type=ActionType.SHOOT,
                 target_x=target.x, target_y=target.y, target_z=target.z,
             )
+
+        # 1b) Артиллерия: если никого не видит — «слепой» выстрел по
+        # предполагаемой клетке (shoot_anywhere=True позволяет).
+        # Приоритет:
+        #   a) недавно замеченные враги (last_known_enemies) + случайная
+        #      компенсация их возможного шага (±1 по каждой оси, bias к
+        #      нашим кораблям).
+        #   b) если памяти нет — случайная клетка в стартовой зоне каждой
+        #      из ДРУГИХ команд (x=9 / y=9 ...), чтобы не тратить ход.
+        if (
+            getattr(ship, 'shoot_anywhere', False)
+            and ship.can_shoot
+            and not visible_ships
+        ):
+            blind = self._pick_blind_target(ship, my_ships, all_ships)
+            if blind is not None:
+                bx, by, bz = blind
+                return Action(
+                    ship_id=ship.id,
+                    action_type=ActionType.SHOOT,
+                    target_x=bx, target_y=by, target_z=bz,
+                )
 
         # 2) Движение (учтём расширенный радиус у Прыгуна/Бурава).
         effective_move = max(
@@ -495,6 +708,13 @@ def simulate(
     for s in ships_ref.values():
         _ensure_type(s.ship_type.value)['deployed'] += 1
 
+    # Стат для пассивок: сколько раз радиовышка каждой команды
+    # сканировала реальные вражеские корабли в своём Z-слое.
+    radio_scan_stats: dict[str, dict] = {
+        t.value: {'scans_performed': 0, 'enemies_scanned': 0, 'unique_enemies': set()}
+        for t in (Team.TEAM_A, Team.TEAM_B, Team.TEAM_C)
+    }
+
     turn = 0
     while turn < max_turns and not server.game_state['game_over']:
         turn += 1
@@ -503,6 +723,65 @@ def simulate(
         # 1. GM сигналит "начать ход".
         gm.start_turn(server)
         transcript.p("GM: start_turn")
+
+        # 1b. Пассивка Радиовышки: лог, какие враги находятся в её Z-слое
+        # (это клетки, которые без неё не были бы видны команде).
+        ships_now = server.game_state['ships']
+        transcript.h("Радиовышки: сканирование слоя Z")
+        any_scan_logged = False
+        for team in (Team.TEAM_A, Team.TEAM_B, Team.TEAM_C):
+            radios = [
+                s for s in ships_now.values()
+                if s.team == team and s.alive
+                and s.ship_type == ShipType.RADIO
+            ]
+            if not radios:
+                continue
+            for r in radios:
+                enemies_in_z = [
+                    s for s in ships_now.values()
+                    if s.team != team and s.alive and s.z == r.z
+                    and not getattr(s, 'is_phased', False)
+                ]
+                # Определяем, какие из них НЕ были бы видны без радиовышки
+                # (все союзники дальше 3 клеток от них).
+                team_allies = [
+                    a for a in ships_now.values()
+                    if a.team == team and a.alive and a.ship_type != ShipType.RADIO
+                ]
+                exclusive = []
+                for e in enemies_in_z:
+                    in_normal_vision = any(
+                        max(abs(e.x - a.x), abs(e.y - a.y), abs(e.z - a.z)) <= 3
+                        for a in team_allies
+                    )
+                    if not in_normal_vision:
+                        exclusive.append(e)
+                radio_scan_stats[team.value]['scans_performed'] += 1
+                radio_scan_stats[team.value]['enemies_scanned'] += len(enemies_in_z)
+                for e in exclusive:
+                    radio_scan_stats[team.value]['unique_enemies'].add(e.id)
+                if enemies_in_z:
+                    summary = ", ".join(
+                        f"{e.name}({e.x},{e.y},{e.z})"
+                        for e in sorted(
+                            enemies_in_z,
+                            key=lambda e: (e.team.value, e.x, e.y, e.z)
+                        )
+                    )
+                    tag = f"[+{len(exclusive)} эксклюзивно]" if exclusive else ""
+                    transcript.p(
+                        f"  {r.name} (z={r.z}): видит {len(enemies_in_z)} врагов "
+                        f"{tag} → {summary}"
+                    )
+                    any_scan_logged = True
+                else:
+                    transcript.p(
+                        f"  {r.name} (z={r.z}): слой чист"
+                    )
+                    any_scan_logged = True
+        if not any_scan_logged:
+            transcript.p("  (у команд не осталось живых радиовышек)")
 
         # 2. Каждая команда собирает действия.
         actions_by_team: dict[Team, list[Action]] = {}
@@ -736,6 +1015,15 @@ def simulate(
             f"hp={remaining_hp[team.value]}"
         )
 
+    transcript.h("Сводка по пассивкам радиовышек")
+    for team_value, rs in radio_scan_stats.items():
+        unique_count = len(rs['unique_enemies'])
+        transcript.p(
+            f"  {team_value}: сканирований={rs['scans_performed']}, "
+            f"всего врагов-в-слоях={rs['enemies_scanned']}, "
+            f"уникальных эксклюзивных (видны только радиовышкой)={unique_count}"
+        )
+
     transcript.h("Сводка по попаданиям")
     history = server.game_state['hit_history']
     kills = sum(1 for h in history if h.get('killed'))
@@ -768,6 +1056,14 @@ def simulate(
         pass
 
     total_damage = sum(stats[t]['damage_dealt'] for t in stats)
+    radio_stats_out = {
+        tv: {
+            'scans_performed': rs['scans_performed'],
+            'enemies_scanned': rs['enemies_scanned'],
+            'unique_exclusive': len(rs['unique_enemies']),
+        }
+        for tv, rs in radio_scan_stats.items()
+    }
     return {
         'seed': seed,
         'mode': game_mode,
@@ -778,6 +1074,7 @@ def simulate(
         'remaining_hp': remaining_hp,
         'stats': stats,
         'type_stats': type_stats,
+        'radio_stats': radio_stats_out,
         'total_damage': total_damage,
         'avg_damage_per_turn': round(total_damage / turn, 2) if turn else 0,
         'log_path': out_path,
