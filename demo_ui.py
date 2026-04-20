@@ -123,12 +123,76 @@ def run_cards():
     root.mainloop()
 
 
+def _demo_history():
+    """Возвращает примерную история событий для журнала боя."""
+    return [
+        # ход 1 — обычные попадания
+        {"turn": 1, "attacker": "Team A", "attacker_name": "Артиллерия A1",
+         "target": "Team B", "target_name": "Прыгун B1",
+         "position": "(4,6,4)", "damage": 1, "killed": False},
+        {"turn": 1, "attacker": "Team B", "attacker_name": "Прыгун B1",
+         "target": "Team C", "target_name": "Бурав C1",
+         "position": "(7,5,4)", "damage": 1, "killed": False},
+        # ход 2 — таран
+        {"turn": 2, "attacker": "Team A", "attacker_name": "Прыгун A2",
+         "target": "Team C", "target_name": "Провокатор C2",
+         "position": "(8,6,4)", "damage": 2, "killed": True,
+         "ram": True, "type": "ram_kill"},
+        {"turn": 2, "attacker": "Team C", "attacker_name": "Бурав C1",
+         "target": "Team A", "target_name": "Факел A3",
+         "position": "(4,3,4)", "damage": 1, "killed": False},
+        # ход 3 — мина и убийство
+        {"turn": 3, "type": "mine_detonated", "owner": "Team A",
+         "mine_id": "A7-mine", "target": "Team B", "target_name": "Прыгун B1",
+         "position": "(5,4,4)", "damage": 2, "killed": True},
+        {"turn": 3, "attacker": "Team B", "attacker_name": "Артиллерия B2",
+         "target": "Team A", "target_name": "Факел A3",
+         "position": "(4,3,4)", "damage": 1, "killed": True},
+        # ход 4 — голограмма + добивание
+        {"turn": 4, "type": "hologram_destroyed", "attacker": "Team B",
+         "attacker_name": "Бурав B4", "owner": "Team A",
+         "hologram_id": "A6-holo", "position": "(6,4,4)"},
+        {"turn": 4, "attacker": "Team A", "attacker_name": "Артиллерия A1",
+         "target": "Team B", "target_name": "Тишина B3",
+         "position": "(6,6,4)", "damage": 1, "killed": True},
+    ]
+
+
+def run_log():
+    """Демо: рендер журнала боя."""
+    root = Tk()
+    apply_theme(root)
+    root.title("demo: журнал боя")
+    root.configure(bg=Palette().bg_root)
+    root.geometry("760x520")
+
+    class _Mock:
+        colors = {
+            'panel': Palette().bg_panel,
+            'bg2': Palette().bg_card,
+            'accent4': Palette().accent_info,
+        }
+        root = None
+        create_history_panel = GameClientGUI.create_history_panel
+        _history_event_icon = GameClientGUI._history_event_icon
+        _short_team = GameClientGUI._short_team
+        update_history = GameClientGUI.update_history
+
+    m = _Mock()
+    m.root = root
+    m.create_history_panel()
+    m.update_history(_demo_history())
+    root.mainloop()
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "map"
     if cmd == "map":
         run_map()
     elif cmd == "cards":
         run_cards()
+    elif cmd == "log":
+        run_log()
     else:
         print(f"unknown demo '{cmd}'", file=sys.stderr)
         sys.exit(2)

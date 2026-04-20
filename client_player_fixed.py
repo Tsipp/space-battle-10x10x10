@@ -900,20 +900,23 @@ class GameClientGUI:
             self._make_scrollable_cards(enemies_frame)
     
     def create_history_panel(self):
-        """Журнал попаданий за всю партию (cumulative)."""
+        """Журнал боя за всю партию (с иконками и цветными тегами)."""
+        pal = Palette()
+        fnt = Fonts()
         hist_frame = LabelFrame(
-            self.root, text="📜 ЖУРНАЛ ПОПАДАНИЙ",
-            bg=self.colors['panel'], fg=self.colors['accent4'],
-            font=('Arial', 11, 'bold'),
+            self.root, text="📜 ЖУРНАЛ БОЯ",
+            bg=pal.bg_panel, fg=pal.accent_info,
+            font=fnt.h3,
         )
         hist_frame.pack(fill=BOTH, expand=False, padx=10, pady=5)
 
-        inner = Frame(hist_frame, bg=self.colors['panel'])
-        inner.pack(fill=BOTH, expand=True, padx=10, pady=5)
+        inner = Frame(hist_frame, bg=pal.bg_panel)
+        inner.pack(fill=BOTH, expand=True, padx=6, pady=4)
 
         self.history_text = Text(
-            inner, height=6, bg=self.colors['bg2'], fg='white',
-            font=('Consolas', 9), wrap=NONE, state=DISABLED,
+            inner, height=8, bg=pal.bg_card, fg=pal.fg_primary,
+            font=fnt.log, wrap=NONE, state=DISABLED,
+            bd=0, highlightthickness=0, padx=6, pady=4,
         )
         self.history_text.pack(side=LEFT, fill=BOTH, expand=True)
 
@@ -921,32 +924,136 @@ class GameClientGUI:
         self.history_text.configure(yscrollcommand=sb.set)
         sb.pack(side=RIGHT, fill=Y)
 
+        # Настраиваем цветные теги.
+        t = self.history_text
+        t.tag_configure("turn_header", foreground=pal.accent_info,
+                        font=fnt.small_bold, spacing1=6, spacing3=2)
+        t.tag_configure("summary", foreground=pal.fg_secondary, font=fnt.small)
+        t.tag_configure("A", foreground=TEAM_COLORS.get("Team A", pal.accent_info),
+                        font=fnt.small_bold)
+        t.tag_configure("B", foreground=TEAM_COLORS.get("Team B", pal.accent_danger),
+                        font=fnt.small_bold)
+        t.tag_configure("C", foreground=TEAM_COLORS.get("Team C", pal.accent_success),
+                        font=fnt.small_bold)
+        t.tag_configure("hit", foreground=pal.accent_warning)
+        t.tag_configure("killed", foreground=pal.accent_danger, font=fnt.small_bold)
+        t.tag_configure("ram", foreground=pal.accent_phase, font=fnt.small_bold)
+        t.tag_configure("mine", foreground=pal.accent_mine, font=fnt.small_bold)
+        t.tag_configure("holo", foreground=pal.accent_phase)
+        t.tag_configure("muted", foreground=pal.fg_muted)
+        t.tag_configure("empty", foreground=pal.fg_muted, justify="center")
+
+    def _history_event_icon(self, ev):
+        """Возвращает иконку-префикс по типу события."""
+        if ev.get('type') == 'mine_detonated':
+            return "🕷"
+        if ev.get('type') == 'hologram_destroyed':
+            return "🎭"
+        if ev.get('ram') or ev.get('type') == 'ram_kill':
+            return "💥"
+        if ev.get('killed'):
+            return "💀"
+        return "🎯"
+
+    def _short_team(self, team):
+        """'Team A' -> 'A'. Возвращает одно-буквенную метку команды."""
+        if not team:
+            return "?"
+        return team.replace("Team ", "").strip() or team[:1]
+
     def update_history(self, history):
-        """Обновляет журнал попаданий."""
+        """Обновляет журнал боя с группировкой по ходам, цветами и итогами."""
         if not hasattr(self, 'history_text'):
             return
-        self.history_text.config(state=NORMAL)
-        self.history_text.delete(1.0, END)
+        t = self.history_text
+        t.config(state=NORMAL)
+        t.delete(1.0, END)
+
         if not history:
-            self.history_text.insert(END, "Попаданий ещё не было\n")
-        else:
-            self.history_text.insert(END, f"Всего событий: {len(history)}\n\n")
-            for hit in history:
-                turn = hit.get('turn', '?')
-                attacker = hit.get('attacker', '?')
-                attacker_name = hit.get('attacker_name', '')
-                target = hit.get('target', '?')
-                target_name = hit.get('target_name', '')
-                position = hit.get('position', '?')
-                killed = hit.get('killed', False)
-                marker = "💀" if killed else "🎯"
-                self.history_text.insert(
-                    END,
-                    f"T{turn:>2}: {marker} {attacker} {attacker_name} → "
-                    f"{target} {target_name} @ {position}\n",
-                )
-        self.history_text.see(END)
-        self.history_text.config(state=DISABLED)
+            t.insert(END, "\n   Событий пока нет — ждём первого хода.\n", "empty")
+            t.config(state=DISABLED)
+            return
+
+        # Группируем по ходам.
+        by_turn = {}
+        for ev in history:
+            by_turn.setdefault(ev.get('turn', 0), []).append(ev)
+
+        for turn in sorted(by_turn.keys()):
+            events = by_turn[turn]
+            # Подсчёт урона/убийств по атакующей команде.
+            dmg = {"A": 0, "B": 0, "C": 0}
+            kills = {"A": 0, "B": 0, "C": 0}
+            for ev in events:
+                atk = self._short_team(ev.get('attacker') or ev.get('owner', ''))
+                if atk in dmg:
+                    dmg[atk] += ev.get('damage', 0) or 0
+                    if ev.get('killed'):
+                        kills[atk] += 1
+            parts = []
+            for k in ("A", "B", "C"):
+                if dmg[k] or kills[k]:
+                    piece = f"{k}:{dmg[k]}dmg"
+                    if kills[k]:
+                        piece += f"/{kills[k]}✖"
+                    parts.append(piece)
+            summary = "  •  ".join(parts) if parts else "нет попаданий"
+            t.insert(END, f"── Ход {turn} ", "turn_header")
+            t.insert(END, f"({summary})\n", "summary")
+
+            for ev in events:
+                icon = self._history_event_icon(ev)
+                atk_team = self._short_team(ev.get('attacker') or ev.get('owner', ''))
+                tgt_team = self._short_team(ev.get('target', ''))
+                attacker_name = ev.get('attacker_name', '')
+                target_name = ev.get('target_name', '')
+                position = ev.get('position', '')
+                damage = ev.get('damage', 0)
+                killed = ev.get('killed', False)
+                etype = ev.get('type') or ('ram_kill' if ev.get('ram') else 'hit')
+
+                # Префикс-иконка + ход.
+                t.insert(END, f"  {icon} ", "hit")
+                # Атакующий (команда + имя), если есть.
+                if ev.get('type') == 'mine_detonated':
+                    t.insert(END, f"Мина({atk_team})", atk_team if atk_team in "ABC" else "muted")
+                elif attacker_name:
+                    if atk_team in "ABC":
+                        t.insert(END, atk_team, atk_team)
+                    t.insert(END, f" {attacker_name}", "hit" if not killed else "killed")
+                # Разделитель.
+                if etype == 'ram_kill' or ev.get('ram'):
+                    t.insert(END, "  ⚡таран  ", "ram")
+                elif ev.get('type') == 'hologram_destroyed':
+                    t.insert(END, "  раскрыл  ", "holo")
+                elif ev.get('type') == 'mine_detonated':
+                    t.insert(END, " → ", "muted")
+                else:
+                    t.insert(END, " → ", "muted")
+                # Цель.
+                if ev.get('type') == 'hologram_destroyed':
+                    t.insert(END, "голограмму ", "holo")
+                    owner = self._short_team(ev.get('owner', ''))
+                    if owner in "ABC":
+                        t.insert(END, owner, owner)
+                else:
+                    if tgt_team in "ABC":
+                        t.insert(END, tgt_team, tgt_team)
+                    if target_name:
+                        t.insert(END, f" {target_name}",
+                                 "killed" if killed else "hit")
+                # Позиция.
+                if position:
+                    t.insert(END, f"  @{position}", "muted")
+                # Урон / отметка убийства.
+                if damage:
+                    t.insert(END, f"  −{damage}HP", "killed" if killed else "hit")
+                if killed:
+                    t.insert(END, "  ✖УБИТ", "killed")
+                t.insert(END, "\n")
+
+        t.see(END)
+        t.config(state=DISABLED)
 
     def create_button_panel(self):
         """Панель с кнопками управления"""
