@@ -238,27 +238,62 @@ class TestSilence:
         visible_for_b = server.get_visible_enemies(Team.TEAM_B)
         assert "A1" not in visible_for_b, "Фазированный не должен быть в visible_enemies"
 
-    def test_phase_toggle_off(self, server):
+    def test_phase_auto_expires_after_one_turn(self, server):
+        """Баланс v6: фаза длится ровно 1 ход, потом авто-выход."""
         silence = _ship("A1", Team.TEAM_A, 0, 0, 0, ShipType.SILENCE)
-        silence.is_phased = True
         _set_ships(server, [silence])
+        # Ход 1: активируем фазу.
         server.actions_received = {
             Team.TEAM_A: [Action("A1", ActionType.PHASE)],
             Team.TEAM_B: [], Team.TEAM_C: [],
         }
         server.process_turn()
+        assert silence.is_phased is True
+        assert silence.phase_cooldown == 3
+        # Ход 2: фаза должна спасть автоматически.
+        server.actions_received = {
+            Team.TEAM_A: [], Team.TEAM_B: [], Team.TEAM_C: [],
+        }
+        server.process_turn()
         assert silence.is_phased is False
+        assert silence.phase_cooldown == 2
+
+    def test_phase_cooldown_blocks_reactivation(self, server):
+        """Баланс v6: фазу нельзя активировать пока кулдаун > 0."""
+        silence = _ship("A1", Team.TEAM_A, 0, 0, 0, ShipType.SILENCE)
+        _set_ships(server, [silence])
+        # Ход 1: фаза.
+        server.actions_received = {
+            Team.TEAM_A: [Action("A1", ActionType.PHASE)],
+            Team.TEAM_B: [], Team.TEAM_C: [],
+        }
+        server.process_turn()
+        # Ходы 2–3: пытаемся снова войти в фазу до снятия кулдауна.
+        for _ in range(2):
+            server.actions_received = {
+                Team.TEAM_A: [Action("A1", ActionType.PHASE)],
+                Team.TEAM_B: [], Team.TEAM_C: [],
+            }
+            server.process_turn()
+            assert silence.is_phased is False, "Кулдаун запрещает фазу"
+        # Ход 4: кулдаун обнулился, можно снова фазиться.
+        server.actions_received = {
+            Team.TEAM_A: [Action("A1", ActionType.PHASE)],
+            Team.TEAM_B: [], Team.TEAM_C: [],
+        }
+        server.process_turn()
+        assert silence.is_phased is True
 
     def test_phased_ship_does_not_block_enemy_movement(self, server):
         """Фаза = прозрачность: вражеский корабль должен свободно входить
         в клетку, где стоит корабль в фазе (согласованно с _resolve_shot
         и get_visible_enemies)."""
         silence = _ship("A1", Team.TEAM_A, 5, 5, 5, ShipType.SILENCE)
-        silence.is_phased = True
         enemy = _ship("B1", Team.TEAM_B, 5, 4, 5, ShipType.CRUISER)
         _set_ships(server, [silence, enemy])
+        # Баланс v6: фаза активируется через PHASE-действие в этом же ходу.
         server.actions_received = {
-            Team.TEAM_A: [],
+            Team.TEAM_A: [Action("A1", ActionType.PHASE)],
             Team.TEAM_B: [Action("B1", ActionType.MOVE, 5, 5, 5)],
             Team.TEAM_C: [],
         }
@@ -269,12 +304,8 @@ class TestSilence:
         assert silence.alive is True
         assert enemy.alive is True
 
-    def test_jumper_rams_through_phased_ally_of_target(self, server):
-        """Прыгун может приземлиться в клетку, где стоит фазированный враг,
-        и не считается это «таран заблокирован». Вражеский фазированный
-        корабль остаётся жив (он неуязвим), но движению не мешает —
-        Прыгун приземляется поверх него, а «вражеский корабль в клетке»
-        отсутствует с точки зрения движка."""
+    def test_jumper_ram_pierces_phase(self, server):
+        """Баланс v6: таран Прыгуна пробивает фазу и убивает врага."""
         jumper = _ship("A1", Team.TEAM_A, 0, 0, 0, ShipType.JUMPER)
         phased_enemy = _ship("B1", Team.TEAM_B, 2, 0, 0, ShipType.SILENCE)
         phased_enemy.is_phased = True
@@ -285,7 +316,21 @@ class TestSilence:
         }
         server.process_turn()
         assert (jumper.x, jumper.y, jumper.z) == (2, 0, 0)
-        assert phased_enemy.alive is True
+        assert phased_enemy.alive is False, "Таран пробивает фазу"
+
+    def test_drill_ram_pierces_phase(self, server):
+        """Баланс v6: таран Бурава тоже пробивает фазу."""
+        drill = _ship("A1", Team.TEAM_A, 0, 0, 0, ShipType.DRILL)
+        phased_enemy = _ship("B1", Team.TEAM_B, 3, 0, 0, ShipType.SILENCE)
+        phased_enemy.is_phased = True
+        _set_ships(server, [drill, phased_enemy])
+        server.actions_received = {
+            Team.TEAM_A: [Action("A1", ActionType.MOVE, 3, 0, 0)],
+            Team.TEAM_B: [], Team.TEAM_C: [],
+        }
+        server.process_turn()
+        assert (drill.x, drill.y, drill.z) == (3, 0, 0)
+        assert phased_enemy.alive is False
 
 
 # ==========================================================================

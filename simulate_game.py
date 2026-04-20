@@ -379,10 +379,11 @@ class TeamBot:
                 and max(abs(e.x - ship.x), abs(e.y - ship.y), abs(e.z - ship.z))
                     <= getattr(e, 'shoot_range', 0)
             ]
-            if threatening and not ship.is_phased:
-                return Action(ship.id, ActionType.PHASE)
-            if not threatening and ship.is_phased and ship.hits == 0:
-                # Угрозы нет и мы здоровы — выйти, чтобы не торчать бесполезно.
+            # Баланс v6: PHASE длится 1 ход и уходит в 3-ходовый кулдаун;
+            # выходить из неё вручную нельзя (и не нужно). Активируем, когда
+            # действительно угрожают, и только если кулдаун снят.
+            phase_cd = getattr(ship, 'phase_cooldown', 0)
+            if threatening and not ship.is_phased and phase_cd == 0:
                 return Action(ship.id, ActionType.PHASE)
             # В фазе и ранены: продолжаем держаться, обычное move-поведение
             # всё равно доступно (в фазе можно ходить, нельзя только быть
@@ -1121,8 +1122,30 @@ def simulate(
         transcript.p(f"Игра окончена. Победитель: {winner}")
         transcript.p(f"Ходов сыграно: {turn}")
     else:
-        winner = '—'
-        transcript.p(f"Лимит ходов ({max_turns}) исчерпан, ничья/пат.")
+        # Баланс v6: при исчерпании лимита ходов победитель — команда с
+        # максимальным нанесённым уроном. Если максимум одинаковый у
+        # нескольких — настоящая ничья.
+        damage_by_team = {t.value: stats[t.value]['damage_dealt']
+                          for t in (Team.TEAM_A, Team.TEAM_B, Team.TEAM_C)}
+        max_damage = max(damage_by_team.values()) if damage_by_team else 0
+        leaders = [t for t, d in damage_by_team.items() if d == max_damage]
+        if max_damage > 0 and len(leaders) == 1:
+            winner = leaders[0]
+            transcript.p(
+                f"Лимит ходов ({max_turns}) исчерпан. Победа по урону: {winner} "
+                f"({max_damage} dmg)."
+            )
+            transcript.p(
+                f"   Урон по командам: " + ", ".join(
+                    f"{t}={d}" for t, d in damage_by_team.items()
+                )
+            )
+        else:
+            winner = '—'
+            transcript.p(
+                f"Лимит ходов ({max_turns}) исчерпан, ничья "
+                f"(урон: {damage_by_team})."
+            )
 
     # Финальные выжившие и агрегаты.
     ships = server.game_state['ships']

@@ -1205,9 +1205,19 @@ class GameServer:
         self.game_state['last_hits'] = []
         self.game_state['last_events'] = []
 
+        # ==== ПРЕДФАЗА: авто-выход из фазы прошлого хода + тик кулдауна ====
+        # Баланс v6: фаза длится РОВНО 1 ход; после этого корабль сам выходит
+        # из фазы, и 3-ходовый кулдаун начинает обратный отсчёт.
+        for ship in ships.values():
+            if getattr(ship, 'is_phased', False):
+                ship.is_phased = False
+                self.log(f"   🌀 {ship.name}: фаза спала (действовала 1 ход)", 'info')
+            if getattr(ship, 'phase_cooldown', 0) > 0:
+                ship.phase_cooldown -= 1
+
         # ==== ФАЗА 0: PHASE (неуязвимость) ====
-        # Делается ПЕРВОЙ, чтобы включение/выключение фазы действовало
-        # уже в этот же ход на движение/выстрелы/мины/тараны.
+        # Делается ПЕРВОЙ, чтобы включение фазы действовало уже в этот же ход
+        # на движение/выстрелы/мины/тараны.
         for team, actions in self.actions_received.items():
             for action in actions:
                 if action.action_type != ActionType.PHASE:
@@ -1218,15 +1228,23 @@ class GameServer:
                 if not ship.can_phase:
                     self.log(f"   ⚠️ {ship.name} не может уходить в фазу", 'warning')
                     continue
-                ship.is_phased = not ship.is_phased
-                msg = f"🌀 {ship.name}: фаза {'ВКЛ' if ship.is_phased else 'ВЫКЛ'}"
-                self.log(f"   {msg}", 'info')
+                if getattr(ship, 'phase_cooldown', 0) > 0:
+                    self.log(
+                        f"   ⚠️ {ship.name}: фаза на кулдауне ({ship.phase_cooldown} ход.)",
+                        'warning',
+                    )
+                    continue
+                # Баланс v6: PHASE — это АКТИВАЦИЯ, не toggle. Длится 1 ход,
+                # после чего авто-выход + 3 хода кулдауна.
+                ship.is_phased = True
+                ship.phase_cooldown = 3
+                self.log(f"   🌀 {ship.name}: уходит в фазу на 1 ход", 'info')
                 self.game_state['last_events'].append({
                     'turn': self.game_state['turn'] + 1,
                     'type': 'phase_toggle',
                     'team': team.value,
                     'ship_name': ship.name,
-                    'is_phased': ship.is_phased,
+                    'is_phased': True,
                 })
 
         # ==== ФАЗА 1: HOLOGRAM (Провокатор) ====
@@ -1702,17 +1720,25 @@ class GameServer:
                     )
                     return False
 
-        # Корабли в фазе (Тишина с is_phased=True) прозрачны и неосязаемы:
-        # другие корабли могут свободно проходить/приземляться в их клетку, как
-        # для обычного MOVE, так и для тарана Прыгуна/Бурава. Поведение
-        # согласовано с _resolve_shot и get_visible_enemies.
-        target_ship = next(
-            (s for s in ships.values()
-             if s.alive and s.id != ship.id
-             and not getattr(s, 'is_phased', False)
-             and (s.x, s.y, s.z) == (tx, ty, tz)),
-            None,
-        )
+        # Корабли в фазе (Тишина с is_phased=True) прозрачны для обычных
+        # движений/выстрелов, но (баланс v6) таран Прыгуна/Бурава их пробивает —
+        # для них фаза не защищает. Для обычного MOVE/приземления фильтруем
+        # фазовые, для тарана — нет.
+        if is_jumper or is_drill:
+            target_ship = next(
+                (s for s in ships.values()
+                 if s.alive and s.id != ship.id
+                 and (s.x, s.y, s.z) == (tx, ty, tz)),
+                None,
+            )
+        else:
+            target_ship = next(
+                (s for s in ships.values()
+                 if s.alive and s.id != ship.id
+                 and not getattr(s, 'is_phased', False)
+                 and (s.x, s.y, s.z) == (tx, ty, tz)),
+                None,
+            )
         target_holo = next(
             (h for h in holograms.values()
              if h.get('alive', True) and (h['x'], h['y'], h['z']) == (tx, ty, tz)),
@@ -1732,11 +1758,12 @@ class GameServer:
                     )
                     return False
                 if getattr(target_ship, 'is_phased', False):
+                    # Баланс v6: таран Прыгуна/Бурава пробивает фазу.
+                    target_ship.is_phased = False
                     self.log(
-                        f"   ⚠️ {ship.name}: цель {target_ship.name} в фазе — таран не прошёл",
-                        'warning',
+                        f"   💥 {ship.name} пробивает фазу {target_ship.name} тараном",
+                        'success',
                     )
-                    return False
                 # Убиваем тараном
                 target_ship.alive = False
                 target_ship.hits = target_ship.max_hits
