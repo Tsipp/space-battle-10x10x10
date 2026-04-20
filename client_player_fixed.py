@@ -1194,10 +1194,13 @@ class GameClientGUI:
               bg=self.colors['panel'], fg=self.colors['accent1'],
               font=('Arial', 11, 'bold')).pack(anchor=W, padx=10, pady=5)
         
-        rules_text = """• 🚀 Перемещение: на 1 клетку в любом направлении
-• 🎯 Стрельба: обычные корабли - по прямой до 5 клеток
-• 💥 Артиллерия: не двигается, стреляет куда угодно
-• 📡 Радиовышка: не стреляет, сканирует весь слой Z"""
+        rules_text = """• 🚀 Перемещение: на 1 клетку в любом направлении (Прыгун — 3, Бурав — 3 по прямой, Факел/Базовый — 1)
+• 🎯 Стрельба: обычные корабли — по прямой до 5 клеток; Артиллерия — куда угодно (2 урона)
+• 📡 Радиовышка: не стреляет, сканирует весь слой Z
+• 💚 Факел: лечит союзников в радиусе 1 (действие HEAL — без цели)
+• 🌀 Тишина: вкл/выкл фазу (неуязвимость и невидимость), действие PHASE
+• 🪞 Провокатор: ставит голограмму (декой) в соседнюю клетку
+• 💣 Паук: ставит мину (2 урона врагу при входе) в соседнюю клетку"""
         
         Label(rules_frame, text=rules_text, bg=self.colors['panel'],
               fg='white', font=('Arial', 9), justify=LEFT).pack(anchor=W, padx=20, pady=5)
@@ -1355,7 +1358,120 @@ class GameClientGUI:
                 Label(ship_frame, text="📡 Радиовышка не может стрелять",
                      bg=self.colors['panel'], fg='#00d4ff',
                      font=('Arial', 9)).pack(anchor=W, padx=20, pady=2)
-            
+
+            # ======= Способности необычных типов (advanced-режим) =======
+            # Флаги берём из ship-dict (сервер их теперь пробрасывает).
+            heal_range = ship.get('heal_range', 0) or 0
+            can_phase = bool(ship.get('can_phase', False))
+            can_create_hologram = bool(ship.get('can_create_hologram', False))
+            can_place_mine = bool(ship.get('can_place_mine', False))
+
+            # Координаты для HOLOGRAM/MINE (соседняя клетка).
+            holo_x_var = StringVar(value=str(ship['x']))
+            holo_y_var = StringVar(value=str(ship['y']))
+            holo_z_var = StringVar(value=str(ship['z']))
+            mine_x_var = StringVar(value=str(ship['x']))
+            mine_y_var = StringVar(value=str(ship['y']))
+            mine_z_var = StringVar(value=str(ship['z']))
+
+            if heal_range > 0:
+                heal_frame = Frame(ship_frame, bg=self.colors['panel'])
+                heal_frame.pack(anchor=W, padx=20, pady=5, fill=X)
+                Radiobutton(
+                    heal_frame,
+                    text=f"💚 Лечить союзников в радиусе {heal_range} (HEAL)",
+                    variable=action_var, value="heal",
+                    bg=self.colors['panel'], fg='#6bff6b',
+                    selectcolor=self.colors['bg'],
+                    activebackground=self.colors['panel'],
+                ).pack(side=LEFT)
+
+            if can_phase:
+                phase_frame = Frame(ship_frame, bg=self.colors['panel'])
+                phase_frame.pack(anchor=W, padx=20, pady=5, fill=X)
+                phase_now = bool(ship.get('is_phased', False))
+                phase_state = "выйти из фазы" if phase_now else "войти в фазу"
+                Radiobutton(
+                    phase_frame,
+                    text=f"🌀 Переключить фазу — {phase_state} (PHASE)",
+                    variable=action_var, value="phase",
+                    bg=self.colors['panel'], fg='#c0a8ff',
+                    selectcolor=self.colors['bg'],
+                    activebackground=self.colors['panel'],
+                ).pack(side=LEFT)
+
+            if can_create_hologram:
+                holo_frame = Frame(ship_frame, bg=self.colors['panel'])
+                holo_frame.pack(anchor=W, padx=20, pady=5, fill=X)
+                Radiobutton(
+                    holo_frame,
+                    text="🪞 Создать голограмму в:",
+                    variable=action_var, value="hologram",
+                    bg=self.colors['panel'], fg='#ffd0ff',
+                    selectcolor=self.colors['bg'],
+                    activebackground=self.colors['panel'],
+                ).pack(side=LEFT)
+                hcoord = Frame(holo_frame, bg=self.colors['panel'])
+                hcoord.pack(side=LEFT, padx=10)
+                Entry(hcoord, textvariable=holo_x_var, width=3,
+                      bg=self.colors['bg2'], fg='white',
+                      insertbackground='white').pack(side=LEFT, padx=1)
+                Entry(hcoord, textvariable=holo_y_var, width=3,
+                      bg=self.colors['bg2'], fg='white',
+                      insertbackground='white').pack(side=LEFT, padx=1)
+                Entry(hcoord, textvariable=holo_z_var, width=3,
+                      bg=self.colors['bg2'], fg='white',
+                      insertbackground='white').pack(side=LEFT, padx=1)
+                holo_status = Label(
+                    holo_frame, text="", bg=self.colors['panel'],
+                    fg=self.colors['accent4'], font=('Arial', 9),
+                )
+                holo_status.pack(side=LEFT, padx=8)
+                Button(
+                    holo_frame, text="🗺 На карте",
+                    bg=self.colors['accent1'], fg='black',
+                    font=('Arial', 9, 'bold'),
+                    command=lambda s=ship, hv=(holo_x_var, holo_y_var, holo_z_var),
+                                   lbl=holo_status:
+                        self.start_target_capture(s, 'hologram', hv, lbl),
+                ).pack(side=LEFT, padx=5)
+
+            if can_place_mine:
+                mine_frame = Frame(ship_frame, bg=self.colors['panel'])
+                mine_frame.pack(anchor=W, padx=20, pady=5, fill=X)
+                Radiobutton(
+                    mine_frame,
+                    text="💣 Поставить мину в:",
+                    variable=action_var, value="mine",
+                    bg=self.colors['panel'], fg='#ff8888',
+                    selectcolor=self.colors['bg'],
+                    activebackground=self.colors['panel'],
+                ).pack(side=LEFT)
+                mcoord = Frame(mine_frame, bg=self.colors['panel'])
+                mcoord.pack(side=LEFT, padx=10)
+                Entry(mcoord, textvariable=mine_x_var, width=3,
+                      bg=self.colors['bg2'], fg='white',
+                      insertbackground='white').pack(side=LEFT, padx=1)
+                Entry(mcoord, textvariable=mine_y_var, width=3,
+                      bg=self.colors['bg2'], fg='white',
+                      insertbackground='white').pack(side=LEFT, padx=1)
+                Entry(mcoord, textvariable=mine_z_var, width=3,
+                      bg=self.colors['bg2'], fg='white',
+                      insertbackground='white').pack(side=LEFT, padx=1)
+                mine_status = Label(
+                    mine_frame, text="", bg=self.colors['panel'],
+                    fg=self.colors['accent4'], font=('Arial', 9),
+                )
+                mine_status.pack(side=LEFT, padx=8)
+                Button(
+                    mine_frame, text="🗺 На карте",
+                    bg=self.colors['accent1'], fg='black',
+                    font=('Arial', 9, 'bold'),
+                    command=lambda s=ship, mv=(mine_x_var, mine_y_var, mine_z_var),
+                                   lbl=mine_status:
+                        self.start_target_capture(s, 'mine', mv, lbl),
+                ).pack(side=LEFT, padx=5)
+
             # Сохраняем данные для этого корабля
             ship_data = {
                 'ship_id': ship['id'],
@@ -1371,8 +1487,25 @@ class GameClientGUI:
                 'shoot_x': shoot_x_var if can_shoot else None,
                 'shoot_y': shoot_y_var if can_shoot else None,
                 'shoot_z': shoot_z_var if can_shoot else None,
+                'holo_x': holo_x_var,
+                'holo_y': holo_y_var,
+                'holo_z': holo_z_var,
+                'mine_x': mine_x_var,
+                'mine_y': mine_y_var,
+                'mine_z': mine_z_var,
                 'can_move': can_move,
-                'can_shoot': can_shoot
+                'can_shoot': can_shoot,
+                'heal_range': heal_range,
+                'can_phase': can_phase,
+                'can_create_hologram': can_create_hologram,
+                'can_place_mine': can_place_mine,
+                # Эффективная дальность перемещения (Прыгун/Бурав > 1).
+                'effective_move_range': max(
+                    int(ship.get('move_range', 1) or 0),
+                    int(ship.get('jump_range', 0) or 0),
+                    int(ship.get('drill_range', 0) or 0),
+                ) or 1,
+                'is_drill': ship_type == 'Бурав' or ship.get('drill_range', 0) > 0,
             }
             
             # Кнопка сохранения
@@ -1432,14 +1565,27 @@ class GameClientGUI:
                 y = int(ship_data['move_y'].get())
                 z = int(ship_data['move_z'].get())
                 
-                # Проверка: можно двигаться только на 1 клетку
+                # Проверка: эффективная дальность перемещения зависит от типа.
+                # Прыгун — 3, Бурав — 3, Факел/Базовый — 1.
                 dx = abs(x - ship_data['ship_x'])
                 dy = abs(y - ship_data['ship_y'])
                 dz = abs(z - ship_data['ship_z'])
-                
-                if max(dx, dy, dz) > 1:
-                    messagebox.showerror("Ошибка", "Можно перемещаться только на 1 клетку!")
+
+                max_dist = ship_data.get('effective_move_range', 1)
+                if max(dx, dy, dz) > max_dist:
+                    messagebox.showerror(
+                        "Ошибка",
+                        f"Этот корабль перемещается максимум на {max_dist} клеток!",
+                    )
                     return
+                if ship_data.get('is_drill'):
+                    axes_changed = (1 if dx else 0) + (1 if dy else 0) + (1 if dz else 0)
+                    if axes_changed != 1:
+                        messagebox.showerror(
+                            "Ошибка",
+                            "Бурав двигается только по одной оси (прямая линия)!",
+                        )
+                        return
                 
                 # Проверка границ
                 if x < 0 or x > 9 or y < 0 or y > 9 or z < 0 or z > 9:
@@ -1519,7 +1665,66 @@ class GameClientGUI:
                     target_y=y,
                     target_z=z
                 )
-            
+
+            elif action_type == "heal":
+                if not ship_data.get('heal_range', 0):
+                    messagebox.showerror("Ошибка", "Этот корабль не умеет лечить!")
+                    return
+                action = Action(
+                    ship_id=ship_id,
+                    action_type=ActionType.HEAL,
+                )
+
+            elif action_type == "phase":
+                if not ship_data.get('can_phase'):
+                    messagebox.showerror("Ошибка", "Этот корабль не умеет уходить в фазу!")
+                    return
+                action = Action(
+                    ship_id=ship_id,
+                    action_type=ActionType.PHASE,
+                )
+
+            elif action_type in ("hologram", "mine"):
+                if action_type == "hologram":
+                    if not ship_data.get('can_create_hologram'):
+                        messagebox.showerror("Ошибка", "Этот корабль не умеет создавать голограммы!")
+                        return
+                    x = int(ship_data['holo_x'].get())
+                    y = int(ship_data['holo_y'].get())
+                    z = int(ship_data['holo_z'].get())
+                    at = ActionType.HOLOGRAM
+                    label = "голограмму"
+                else:
+                    if not ship_data.get('can_place_mine'):
+                        messagebox.showerror("Ошибка", "Этот корабль не умеет ставить мины!")
+                        return
+                    x = int(ship_data['mine_x'].get())
+                    y = int(ship_data['mine_y'].get())
+                    z = int(ship_data['mine_z'].get())
+                    at = ActionType.MINE
+                    label = "мину"
+
+                if not (0 <= x <= 9 and 0 <= y <= 9 and 0 <= z <= 9):
+                    messagebox.showerror("Ошибка", "Координаты должны быть от 0 до 9!")
+                    return
+                dx = abs(x - ship_data['ship_x'])
+                dy = abs(y - ship_data['ship_y'])
+                dz = abs(z - ship_data['ship_z'])
+                dist = max(dx, dy, dz)
+                if dist == 0 or dist > 1:
+                    messagebox.showerror(
+                        "Ошибка",
+                        f"Можно поставить {label} только в СОСЕДНЮЮ клетку (в радиусе 1).",
+                    )
+                    return
+                action = Action(
+                    ship_id=ship_id,
+                    action_type=at,
+                    target_x=x,
+                    target_y=y,
+                    target_z=z,
+                )
+
             else:
                 return
             

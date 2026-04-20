@@ -905,9 +905,12 @@ class GameServer:
                     'game_over': self.game_state['game_over'],
                     'winner': self.game_state['winner'],
                     'game_mode': self.game_state['game_mode'],
-                    'last_hits': self.game_state['last_hits'],
-                    'last_events': self.game_state.get('last_events', []),
-                    'hit_history': self.game_state['hit_history'],
+                    # Снимок-копии списков: сериализация происходит уже вне
+                    # state_lock, а process_turn может параллельно добавлять
+                    # элементы в оригинальные списки.
+                    'last_hits': list(self.game_state['last_hits']),
+                    'last_events': list(self.game_state.get('last_events', [])),
+                    'hit_history': list(self.game_state['hit_history']),
                     'planning_deadline': self.planning_deadline,
                     'planning_timeout': self.planning_timeout,
                     'holograms': own_holograms,
@@ -1046,9 +1049,12 @@ class GameServer:
                     'phase': self.game_state['phase'],
                     'game_over': self.game_state['game_over'],
                     'winner': self.game_state['winner'],
-                    'last_hits': self.game_state['last_hits'],
-                    'last_events': self.game_state.get('last_events', []),
-                    'hit_history': self.game_state['hit_history'],
+                    # Снимок-копии списков: сериализация идёт уже вне
+                    # state_lock, а process_turn может параллельно добавлять
+                    # элементы в оригинальные списки.
+                    'last_hits': list(self.game_state['last_hits']),
+                    'last_events': list(self.game_state.get('last_events', [])),
+                    'hit_history': list(self.game_state['hit_history']),
                     'message': f'Ход {self.game_state["turn"] + 1} - {self.game_state["phase"]}',
                     'game_mode': self.game_state['game_mode'],
                     'planning_deadline': self.planning_deadline,
@@ -1634,9 +1640,15 @@ class GameServer:
                 self.log(f"   ⚠️ {ship.name}: Бурав двигается только по одной оси", 'warning')
                 return False
 
+        # Корабли в фазе (Тишина с is_phased=True) прозрачны и неосязаемы:
+        # другие корабли могут свободно проходить/приземляться в их клетку, как
+        # для обычного MOVE, так и для тарана Прыгуна/Бурава. Поведение
+        # согласовано с _resolve_shot и get_visible_enemies.
         target_ship = next(
             (s for s in ships.values()
-             if s.alive and s.id != ship.id and (s.x, s.y, s.z) == (tx, ty, tz)),
+             if s.alive and s.id != ship.id
+             and not getattr(s, 'is_phased', False)
+             and (s.x, s.y, s.z) == (tx, ty, tz)),
             None,
         )
         target_holo = next(

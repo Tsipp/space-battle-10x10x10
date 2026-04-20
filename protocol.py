@@ -18,6 +18,7 @@ callers can poll with a short timeout without losing data mid-message.
 """
 
 import json
+import select
 import socket
 import struct
 import threading
@@ -59,6 +60,11 @@ class Framed:
         timeout=None => block indefinitely. Loops recv() calls until a full
         frame is in the buffer or the deadline passes, so large messages
         (>65 KB) aren't returned partially.
+
+        Важно: используем ``select.select()`` вместо ``sock.settimeout()``,
+        потому что ``settimeout`` аффектит ВСЕ операции на сокете (в т.ч.
+        ``sendall`` из других потоков) и мог спорадически дропать клиентов
+        при параллельной отправке state из GM-потока.
         """
         msg = self._try_extract()
         if msg is not None:
@@ -68,22 +74,27 @@ class Framed:
 
         while True:
             if deadline is None:
-                self.sock.settimeout(None)
+                remaining = None
             else:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return self._try_extract()
-                self.sock.settimeout(remaining)
+
+            # select() не трогает socket.timeout — так что параллельный
+            # sendall() из другого потока не получает «короткий» таймаут и
+            # не упадёт с socket.timeout → спасает от самопроизвольных
+            # дисконнектов клиентов при отправке state из GM-потока.
+            try:
+                ready, _, _ = select.select([self.sock], [], [], remaining)
+            except (OSError, ValueError) as e:
+                self._closed = True
+                raise ProtocolError(f"select error: {e}") from e
+            if not ready:
+                return self._try_extract()
 
             try:
                 data = self.sock.recv(65536)
-            except socket.timeout:
-                return self._try_extract()
             except ConnectionError as e:
-                # Отдельно ловим ConnectionResetError / ConnectionAbortedError:
-                # это форсированный разрыв со стороны пира. Без этого сервер
-                # продолжал бы до 60с дёргать мёртвое соединение и не
-                # выкидывал игрока из self.clients.
                 self._closed = True
                 raise ProtocolError(f"connection lost: {e}") from e
             except OSError as e:

@@ -181,6 +181,109 @@ class TeamBot:
         return None
 
     def _decide_ship(self, ship, visible_ships, my_ships, reserved):
+        # ---- Способности нестандартных кораблей (только в advanced) --------
+        # Тишина: вошёл в фазу, если ранен; выходит, когда полностью здоров.
+        if getattr(ship, 'can_phase', False):
+            if ship.is_phased and ship.hits == 0:
+                return Action(ship.id, ActionType.PHASE)
+            if not ship.is_phased and ship.hits > 0:
+                return Action(ship.id, ActionType.PHASE)
+            # Если ранен и уже в фазе — двигаемся к союзнику-Факелу.
+            # Здоров и не в фазе — обычное поведение ниже.
+
+        # Факел: лечит, если рядом есть раненый союзник (включая себя).
+        if getattr(ship, 'heal_range', 0) > 0:
+            has_wounded_ally = any(
+                ally.alive and ally.hits > 0
+                and max(abs(ally.x - ship.x), abs(ally.y - ship.y), abs(ally.z - ship.z))
+                    <= ship.heal_range
+                for ally in my_ships
+            )
+            if has_wounded_ally:
+                return Action(ship.id, ActionType.HEAL)
+
+        # Провокатор: ставит голограмму в соседнюю клетку в сторону ближайшего
+        # врага, если враг в пределах 4 клеток и такая клетка свободна.
+        if getattr(ship, 'can_create_hologram', False) and visible_ships:
+            nearest = min(
+                visible_ships,
+                key=lambda e: max(
+                    abs(e.x - ship.x), abs(e.y - ship.y), abs(e.z - ship.z)
+                ),
+            )
+            dist = max(
+                abs(nearest.x - ship.x),
+                abs(nearest.y - ship.y),
+                abs(nearest.z - ship.z),
+            )
+            if 1 <= dist <= 5:
+                step = self._step_toward(
+                    ship.x, ship.y, ship.z, nearest.x, nearest.y, nearest.z, reserved
+                )
+                if step is not None:
+                    tx, ty, tz = step
+                    return Action(
+                        ship.id, ActionType.HOLOGRAM, tx, ty, tz
+                    )
+
+        # Паук: ставит мину в клетку между собой и ближайшим врагом.
+        if getattr(ship, 'can_place_mine', False) and visible_ships:
+            nearest = min(
+                visible_ships,
+                key=lambda e: max(
+                    abs(e.x - ship.x), abs(e.y - ship.y), abs(e.z - ship.z)
+                ),
+            )
+            dist = max(
+                abs(nearest.x - ship.x),
+                abs(nearest.y - ship.y),
+                abs(nearest.z - ship.z),
+            )
+            if 1 <= dist <= 4:
+                step = self._step_toward(
+                    ship.x, ship.y, ship.z, nearest.x, nearest.y, nearest.z, reserved
+                )
+                if step is not None:
+                    tx, ty, tz = step
+                    return Action(
+                        ship.id, ActionType.MINE, tx, ty, tz
+                    )
+
+        # Прыгун: если видит врага в радиусе jump_range — прыгает и убивает
+        # его тараном.
+        if getattr(ship, 'jump_range', 0) > 0 and visible_ships:
+            for enemy in visible_ships:
+                d = max(
+                    abs(enemy.x - ship.x), abs(enemy.y - ship.y), abs(enemy.z - ship.z)
+                )
+                if 1 <= d <= ship.jump_range and not getattr(enemy, 'is_phased', False):
+                    # Союзник в целевой клетке блокирует; редкий случай, но
+                    # проверяем.
+                    if (enemy.x, enemy.y, enemy.z) not in reserved:
+                        return Action(
+                            ship.id, ActionType.MOVE, enemy.x, enemy.y, enemy.z
+                        )
+
+        # Бурав: если видит врага по одной оси в радиусе drill_range —
+        # движется тараном.
+        if getattr(ship, 'drill_range', 0) > 0 and visible_ships:
+            for enemy in visible_ships:
+                axes = (
+                    (1 if enemy.x != ship.x else 0)
+                    + (1 if enemy.y != ship.y else 0)
+                    + (1 if enemy.z != ship.z else 0)
+                )
+                d = max(
+                    abs(enemy.x - ship.x), abs(enemy.y - ship.y), abs(enemy.z - ship.z)
+                )
+                if axes == 1 and 1 <= d <= ship.drill_range \
+                        and not getattr(enemy, 'is_phased', False):
+                    if (enemy.x, enemy.y, enemy.z) not in reserved:
+                        return Action(
+                            ship.id, ActionType.MOVE, enemy.x, enemy.y, enemy.z
+                        )
+
+        # ---- Классическая стратегия ---------------------------------------
         # 1) Стрельба
         target = self._pick_shoot_target(ship, visible_ships)
         if target is not None:
@@ -190,9 +293,13 @@ class TeamBot:
                 target_x=target.x, target_y=target.y, target_z=target.z,
             )
 
-        # 2) Движение
-        if ship.move_range > 0:
-            # Цель: ближайший видимый враг; если таких нет — центр карты.
+        # 2) Движение (учтём расширенный радиус у Прыгуна/Бурава).
+        effective_move = max(
+            ship.move_range,
+            getattr(ship, 'jump_range', 0),
+            getattr(ship, 'drill_range', 0),
+        )
+        if effective_move > 0:
             if visible_ships:
                 anchor = min(
                     visible_ships,
@@ -208,7 +315,7 @@ class TeamBot:
                 ship.x, ship.y, ship.z, tx, ty, tz, reserved
             )
             if step is None:
-                return None  # Некуда шагнуть — пропуск.
+                return None
             nx, ny, nz = step
             return Action(
                 ship_id=ship.id,
@@ -216,7 +323,6 @@ class TeamBot:
                 target_x=nx, target_y=ny, target_z=nz,
             )
 
-        # 3) Ни стрелять, ни двигаться — пропускаем.
         return None
 
 
@@ -244,19 +350,21 @@ class GmBot:
 # Описание одного хода (для лога)
 # ---------------------------------------------------------------------------
 def describe_action(ship, action):
-    if action.action_type == ActionType.MOVE:
-        return (
-            f"[{ship.team.value}] {ship.name} "
-            f"({ship.x},{ship.y},{ship.z}) → MOVE "
-            f"({action.target_x},{action.target_y},{action.target_z})"
-        )
-    if action.action_type == ActionType.SHOOT:
-        return (
-            f"[{ship.team.value}] {ship.name} "
-            f"({ship.x},{ship.y},{ship.z}) → SHOOT at "
-            f"({action.target_x},{action.target_y},{action.target_z})"
-        )
-    return f"[{ship.team.value}] {ship.name} → {action.action_type}"
+    base = f"[{ship.team.value}] {ship.name} ({ship.x},{ship.y},{ship.z})"
+    at = action.action_type
+    if at == ActionType.MOVE:
+        return f"{base} → MOVE ({action.target_x},{action.target_y},{action.target_z})"
+    if at == ActionType.SHOOT:
+        return f"{base} → SHOOT at ({action.target_x},{action.target_y},{action.target_z})"
+    if at == ActionType.HEAL:
+        return f"{base} → HEAL (AoE)"
+    if at == ActionType.PHASE:
+        return f"{base} → PHASE toggle"
+    if at == ActionType.HOLOGRAM:
+        return f"{base} → HOLOGRAM ({action.target_x},{action.target_y},{action.target_z})"
+    if at == ActionType.MINE:
+        return f"{base} → MINE ({action.target_x},{action.target_y},{action.target_z})"
+    return f"{base} → {at}"
 
 
 def team_summary(server: GameServer) -> list[str]:
@@ -283,12 +391,37 @@ def team_summary(server: GameServer) -> list[str]:
 # ---------------------------------------------------------------------------
 # Главный цикл
 # ---------------------------------------------------------------------------
+def _team_stats_zero() -> dict:
+    return {
+        'shoot_hits': 0,
+        'damage_dealt': 0,
+        'kills': 0,
+        'heals': 0,
+        'phases': 0,
+        'holograms': 0,
+        'mines_placed': 0,
+        'mines_triggered': 0,
+        'rams': 0,
+        'shoot_actions': 0,
+        'move_actions': 0,
+        'heal_actions': 0,
+        'phase_actions': 0,
+        'hologram_actions': 0,
+        'mine_actions': 0,
+        'kills_by_ship_type': {},
+        'deaths_by_ship_type': {},
+    }
+
+
 def simulate(
     max_turns: int = 30,
     seed: int = 42,
     game_mode: str = 'advanced',
-) -> str:
-    """Проводит один матч и возвращает путь к лог-файлу."""
+    write_log: bool = True,
+) -> dict:
+    """Проводит один матч и возвращает dict со статистикой (в т.ч. путь
+    к лог-файлу под ключом ``log_path``).
+    """
     rng = random.Random(seed)
     transcript = TranscriptLogger()
 
@@ -318,6 +451,13 @@ def simulate(
     for line in team_summary(server):
         transcript.p(line)
 
+    # Статистика по командам (заполняется по ходу игры).
+    stats: dict[str, dict] = {
+        Team.TEAM_A.value: _team_stats_zero(),
+        Team.TEAM_B.value: _team_stats_zero(),
+        Team.TEAM_C.value: _team_stats_zero(),
+    }
+
     turn = 0
     while turn < max_turns and not server.game_state['game_over']:
         turn += 1
@@ -332,10 +472,11 @@ def simulate(
         for team, bot in bots.items():
             actions_by_team[team] = bot.decide(server)
 
-        # 3. Логируем принятые решения.
+        # 3. Логируем принятые решения + считаем действия по типам.
         transcript.h("Решения ботов")
         ships = server.game_state['ships']
         for team in (Team.TEAM_A, Team.TEAM_B, Team.TEAM_C):
+            tstats = stats[team.value]
             team_actions = actions_by_team[team]
             if not team_actions:
                 transcript.p(f"  [{team.value}] все корабли пропускают ход")
@@ -345,7 +486,19 @@ def simulate(
                 if ship is None:
                     continue
                 transcript.p(f"  {describe_action(ship, action)}")
-            # Корабли без явного действия = пропуск.
+                at = action.action_type
+                if at == ActionType.SHOOT:
+                    tstats['shoot_actions'] += 1
+                elif at == ActionType.MOVE:
+                    tstats['move_actions'] += 1
+                elif at == ActionType.HEAL:
+                    tstats['heal_actions'] += 1
+                elif at == ActionType.PHASE:
+                    tstats['phase_actions'] += 1
+                elif at == ActionType.HOLOGRAM:
+                    tstats['hologram_actions'] += 1
+                elif at == ActionType.MINE:
+                    tstats['mine_actions'] += 1
             passed = {s.id for s in ships.values() if s.team == team and s.alive} \
                 - {a.ship_id for a in team_actions}
             for sid in passed:
@@ -359,21 +512,86 @@ def simulate(
         # 5. Загружаем actions_received и процессим ход.
         server.actions_received = actions_by_team
         turn_before_hits = len(server.game_state['hit_history'])
+        # Запомним раненых до хода, чтобы посчитать heals.
+        hits_before = {s.id: s.hits for s in ships.values() if s.alive}
         server.process_turn()
+        # После хода: heals = раненые, у которых hits уменьшились.
+        for sid, before in hits_before.items():
+            s = ships.get(sid)
+            if s is None or not s.alive:
+                continue
+            if s.hits < before:
+                stats[s.team.value]['heals'] += (before - s.hits)
 
-        # 6. Записываем результаты хода.
-        new_hits = server.game_state['hit_history'][turn_before_hits:]
+        # 6. Разбираем новые события hit_history и обновляем статы.
+        new_events = server.game_state['hit_history'][turn_before_hits:]
         transcript.h("Результаты хода")
-        if not new_hits:
+        if not new_events:
             transcript.p("  Попаданий нет")
         else:
-            for h in new_hits:
-                marker = "УБИТ" if h['killed'] else "ранен"
+            for h in new_events:
+                marker = "УБИТ" if h.get('killed') else "ранен"
                 transcript.p(
-                    f"  {h['attacker']} / {h['attacker_name']:<18} → "
-                    f"{h['target']} / {h['target_name']:<18} "
-                    f"@ {h['position']}  ({marker})"
+                    f"  {h.get('attacker','?')} / {h.get('attacker_name','?'):<18} → "
+                    f"{h.get('target','?')} / {h.get('target_name','?'):<18} "
+                    f"@ {h.get('position','?')}  ({marker})"
                 )
+
+        for h in new_events:
+            attacker = h.get('attacker')
+            target = h.get('target')
+            damage = h.get('damage', 0) or 0
+            is_ram = bool(h.get('ram'))
+            is_mine = h.get('type') == 'mine_detonated'
+            killed = bool(h.get('killed'))
+            if is_mine:
+                owner = h.get('owner')
+                if owner and owner in stats:
+                    stats[owner]['mines_triggered'] += 1
+                    stats[owner]['damage_dealt'] += damage
+                    if killed:
+                        stats[owner]['kills'] += 1
+                        tname = h.get('target_name', '').split()[0] if h.get('target_name') else '?'
+                        stats[owner]['kills_by_ship_type'][tname] = \
+                            stats[owner]['kills_by_ship_type'].get(tname, 0) + 1
+                if target and target in stats:
+                    tname = h.get('target_name', '').split()[0] if h.get('target_name') else '?'
+                    if killed:
+                        stats[target]['deaths_by_ship_type'][tname] = \
+                            stats[target]['deaths_by_ship_type'].get(tname, 0) + 1
+                continue
+            if attacker and attacker in stats:
+                if is_ram:
+                    stats[attacker]['rams'] += 1
+                else:
+                    stats[attacker]['shoot_hits'] += 1
+                stats[attacker]['damage_dealt'] += damage
+                if killed:
+                    stats[attacker]['kills'] += 1
+                    tname = h.get('target_name', '').split()[0] if h.get('target_name') else '?'
+                    stats[attacker]['kills_by_ship_type'][tname] = \
+                        stats[attacker]['kills_by_ship_type'].get(tname, 0) + 1
+            if target and target in stats and killed:
+                tname = h.get('target_name', '').split()[0] if h.get('target_name') else '?'
+                stats[target]['deaths_by_ship_type'][tname] = \
+                    stats[target]['deaths_by_ship_type'].get(tname, 0) + 1
+
+        # Голограммы/мины в state: посчитаем placements.
+        for team_value in stats:
+            stats[team_value]['phases'] = sum(
+                1 for s in ships.values()
+                if s.team.value == team_value and getattr(s, 'is_phased', False)
+            ) + stats[team_value].get('phases_latched', 0)
+        # Проще: количество «поставленных» мин/голограмм — это просто действия этого типа.
+        stats[Team.TEAM_A.value]['mines_placed'] = stats[Team.TEAM_A.value]['mine_actions']
+        stats[Team.TEAM_B.value]['mines_placed'] = stats[Team.TEAM_B.value]['mine_actions']
+        stats[Team.TEAM_C.value]['mines_placed'] = stats[Team.TEAM_C.value]['mine_actions']
+        stats[Team.TEAM_A.value]['holograms'] = stats[Team.TEAM_A.value]['hologram_actions']
+        stats[Team.TEAM_B.value]['holograms'] = stats[Team.TEAM_B.value]['hologram_actions']
+        stats[Team.TEAM_C.value]['holograms'] = stats[Team.TEAM_C.value]['hologram_actions']
+        stats[Team.TEAM_A.value]['phases'] = stats[Team.TEAM_A.value]['phase_actions']
+        stats[Team.TEAM_B.value]['phases'] = stats[Team.TEAM_B.value]['phase_actions']
+        stats[Team.TEAM_C.value]['phases'] = stats[Team.TEAM_C.value]['phase_actions']
 
         transcript.h("Состояние команд после хода")
         for line in team_summary(server):
@@ -386,36 +604,51 @@ def simulate(
         transcript.p(f"Игра окончена. Победитель: {winner}")
         transcript.p(f"Ходов сыграно: {turn}")
     else:
+        winner = '—'
         transcript.p(f"Лимит ходов ({max_turns}) исчерпан, ничья/пат.")
 
-    # Статистика по командам.
+    # Финальные выжившие и агрегаты.
     ships = server.game_state['ships']
+    survivors = {t.value: 0 for t in (Team.TEAM_A, Team.TEAM_B, Team.TEAM_C)}
+    totals = {t.value: 0 for t in (Team.TEAM_A, Team.TEAM_B, Team.TEAM_C)}
+    remaining_hp = {t.value: 0 for t in (Team.TEAM_A, Team.TEAM_B, Team.TEAM_C)}
+    for s in ships.values():
+        totals[s.team.value] += 1
+        if s.alive:
+            survivors[s.team.value] += 1
+            remaining_hp[s.team.value] += (s.max_hits - s.hits)
+
     transcript.h("Сводка по командам")
     for team in (Team.TEAM_A, Team.TEAM_B, Team.TEAM_C):
-        alive = sum(1 for s in ships.values() if s.team == team and s.alive)
-        total = sum(1 for s in ships.values() if s.team == team)
-        transcript.p(f"  {team.value}: {alive}/{total} живых кораблей")
+        transcript.p(
+            f"  {team.value}: {survivors[team.value]}/{totals[team.value]} живых; "
+            f"hp={remaining_hp[team.value]}"
+        )
 
     transcript.h("Сводка по попаданиям")
     history = server.game_state['hit_history']
-    kills = sum(1 for h in history if h['killed'])
-    transcript.p(f"  Всего попаданий: {len(history)}")
-    transcript.p(f"  Уничтожено кораблей: {kills}")
-    by_team: dict[str, int] = {}
-    for h in history:
-        by_team[h['attacker']] = by_team.get(h['attacker'], 0) + 1
-    for team_name, count in sorted(by_team.items()):
-        transcript.p(f"  Попаданий от {team_name}: {count}")
+    kills = sum(1 for h in history if h.get('killed'))
+    transcript.p(f"  Всего событий (шоты+тараны+мины): {len(history)}")
+    transcript.p(f"  Уничтожено кораблей всего: {kills}")
+    for team_name in (Team.TEAM_A.value, Team.TEAM_B.value, Team.TEAM_C.value):
+        ts = stats[team_name]
+        transcript.p(
+            f"  {team_name}: урон={ts['damage_dealt']} хиты={ts['shoot_hits']} "
+            f"тараны={ts['rams']} мины(сработало)={ts['mines_triggered']} "
+            f"убийств={ts['kills']}"
+        )
 
     # GM-бот завершает игру.
     gm.stop(server)
 
     # --- дамп ----------------------------------------------------------------
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%SZ")
-    out_path = os.path.join(
-        ROOT, "game_logs", f"game_{ts}_{game_mode}_seed{seed}.log"
-    )
-    transcript.dump(out_path)
+    out_path = None
+    if write_log:
+        ts_stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%SZ")
+        out_path = os.path.join(
+            ROOT, "game_logs", f"game_{ts_stamp}_{game_mode}_seed{seed}.log"
+        )
+        transcript.dump(out_path)
 
     # Закрыть сокет, чтобы не оставался открытый файловый дескриптор.
     try:
@@ -423,7 +656,20 @@ def simulate(
     except Exception:
         pass
 
-    return out_path
+    total_damage = sum(stats[t]['damage_dealt'] for t in stats)
+    return {
+        'seed': seed,
+        'mode': game_mode,
+        'turns': turn,
+        'winner': winner,
+        'survivors': survivors,
+        'totals': totals,
+        'remaining_hp': remaining_hp,
+        'stats': stats,
+        'total_damage': total_damage,
+        'avg_damage_per_turn': round(total_damage / turn, 2) if turn else 0,
+        'log_path': out_path,
+    }
 
 
 if __name__ == "__main__":

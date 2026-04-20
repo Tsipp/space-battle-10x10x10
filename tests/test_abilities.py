@@ -222,6 +222,44 @@ class TestSilence:
         server.process_turn()
         assert silence.is_phased is False
 
+    def test_phased_ship_does_not_block_enemy_movement(self, server):
+        """Фаза = прозрачность: вражеский корабль должен свободно входить
+        в клетку, где стоит корабль в фазе (согласованно с _resolve_shot
+        и get_visible_enemies)."""
+        silence = _ship("A1", Team.TEAM_A, 5, 5, 5, ShipType.SILENCE)
+        silence.is_phased = True
+        enemy = _ship("B1", Team.TEAM_B, 5, 4, 5, ShipType.CRUISER)
+        _set_ships(server, [silence, enemy])
+        server.actions_received = {
+            Team.TEAM_A: [],
+            Team.TEAM_B: [Action("B1", ActionType.MOVE, 5, 5, 5)],
+            Team.TEAM_C: [],
+        }
+        server.process_turn()
+        # Враг вошёл в клетку фазированного корабля.
+        assert (enemy.x, enemy.y, enemy.z) == (5, 5, 5)
+        # Оба живы (фазированный не пострадал, враг не остановился).
+        assert silence.alive is True
+        assert enemy.alive is True
+
+    def test_jumper_rams_through_phased_ally_of_target(self, server):
+        """Прыгун может приземлиться в клетку, где стоит фазированный враг,
+        и не считается это «таран заблокирован». Вражеский фазированный
+        корабль остаётся жив (он неуязвим), но движению не мешает —
+        Прыгун приземляется поверх него, а «вражеский корабль в клетке»
+        отсутствует с точки зрения движка."""
+        jumper = _ship("A1", Team.TEAM_A, 0, 0, 0, ShipType.JUMPER)
+        phased_enemy = _ship("B1", Team.TEAM_B, 2, 0, 0, ShipType.SILENCE)
+        phased_enemy.is_phased = True
+        _set_ships(server, [jumper, phased_enemy])
+        server.actions_received = {
+            Team.TEAM_A: [Action("A1", ActionType.MOVE, 2, 0, 0)],
+            Team.TEAM_B: [], Team.TEAM_C: [],
+        }
+        server.process_turn()
+        assert (jumper.x, jumper.y, jumper.z) == (2, 0, 0)
+        assert phased_enemy.alive is True
+
 
 # ==========================================================================
 # Провокатор
