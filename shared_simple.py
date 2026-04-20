@@ -18,6 +18,15 @@ class ShipType(Enum):
     ARTILLERY = "Артиллерия"
     RADIO = "Радиовышка"
     BASE = "Базовый"
+    # Новые типы (advanced-режим). Статы заданы ниже в Ship.__init__,
+    # но сами способности (прыжок, лечение, фаза, бурав,
+    # голограмма, мина) ещё не реализованы в логике сервера.
+    JUMPER = "Прыгун"
+    TORCH = "Факел"
+    SILENCE = "Тишина"
+    DRILL = "Бурав"
+    PROVOCATEUR = "Провокатор"
+    SPIDER = "Паук"
 
 
 class Ship:
@@ -40,6 +49,19 @@ class Ship:
         self.shoot_range = 5
         self.shoot_anywhere = False
         self.scan_whole_z = False
+        # Базовый урон от выстрела. Сейчас сервер всегда снимает 1 хит,
+        # но поле задано, чтобы свериться с столбцом «Атака» из ттз и легко
+        # подключить, когда будем реализовывать способности.
+        self.damage = 1
+        # Флаги способностей (дефолты — все выключены). Их логику
+        # будем добавлять следующими итерациями (по техзаданию).
+        self.jump_range = 0          # Прыгун: прыгок на N клеток сквозь корабли.
+        self.heal_range = 0          # Факел: радиус лечения союзников.
+        self.can_phase = False       # Тишина: входит в фазу — неуязвима.
+        self.drill_range = 0         # Бурав: прямая на N клеток сквозь всех.
+        self.can_create_hologram = False  # Провокатор.
+        self.can_place_mine = False  # Паук.
+        self.mine_damage = 0
 
         if ship_type == ShipType.CRUISER:
             self.max_hits = 1
@@ -47,6 +69,7 @@ class Ship:
             self.can_shoot = True
             self.shoot_range = 5
             self.shoot_anywhere = False  # Только по прямой
+            self.damage = 2
 
         elif ship_type == ShipType.ARTILLERY:
             self.max_hits = 3
@@ -54,13 +77,81 @@ class Ship:
             self.can_shoot = True
             self.shoot_range = 10  # Вся карта (макс 10 клеток)
             self.shoot_anywhere = True  # Может стрелять в любую точку
+            self.damage = 2
 
         elif ship_type == ShipType.RADIO:
-            self.max_hits = 2
+            # По тз (03.дополнения): hp=3 для радиовышки.
+            self.max_hits = 3
             self.move_range = 1
             self.can_shoot = False  # Радиовышка не стреляет
             self.shoot_range = 0
             self.scan_whole_z = True  # Сканирует всю плоскость Z
+            self.damage = 0
+
+        elif ship_type == ShipType.JUMPER:
+            # Прыгун: hp=2, прыжок на 3 клетки сквозь корабли,
+            # разрушает корабль в конечной точке. Атака 1.
+            self.max_hits = 2
+            self.move_range = 3
+            self.jump_range = 3
+            self.can_shoot = True
+            self.shoot_range = 5
+            self.shoot_anywhere = False
+            self.damage = 1
+
+        elif ship_type == ShipType.TORCH:
+            # Факел: hp=5, лечит союзников в радиусе 1,
+            # move=1, атака 1. Главный корабль.
+            self.max_hits = 5
+            self.move_range = 1
+            self.heal_range = 1
+            self.can_shoot = True
+            self.shoot_range = 5
+            self.shoot_anywhere = False
+            self.damage = 1
+
+        elif ship_type == ShipType.SILENCE:
+            # Тишина: hp=2, move=1, атака 0,
+            # уходит в «фазу» — неатакуемая, но сама не стреляет.
+            self.max_hits = 2
+            self.move_range = 1
+            self.can_shoot = False
+            self.shoot_range = 0
+            self.can_phase = True
+            self.damage = 0
+
+        elif ship_type == ShipType.DRILL:
+            # Бурав: hp=4, move=2, атака 0,
+            # прямое движение на 3 клетки сквозь всех,
+            # мгновенно убивает корабль, на котором закончил движение.
+            self.max_hits = 4
+            self.move_range = 2
+            self.drill_range = 3
+            self.can_shoot = False
+            self.shoot_range = 0
+            self.damage = 0
+
+        elif ship_type == ShipType.PROVOCATEUR:
+            # Провокатор: hp=2, move=1, атака 1,
+            # создаёт голограмму в соседней пустой клетке.
+            self.max_hits = 2
+            self.move_range = 1
+            self.can_shoot = True
+            self.shoot_range = 5
+            self.shoot_anywhere = False
+            self.can_create_hologram = True
+            self.damage = 1
+
+        elif ship_type == ShipType.SPIDER:
+            # Паук: hp=1, move=1, атака 0, ставит мины в соседние клетки,
+            # которые дают 2 единицы урона.
+            self.max_hits = 1
+            self.move_range = 1
+            self.can_shoot = False
+            self.shoot_range = 0
+            self.can_place_mine = True
+            self.mine_damage = 2
+            self.damage = 0
 
         else:  # Базовый
             self.max_hits = 2
@@ -68,6 +159,7 @@ class Ship:
             self.can_shoot = True
             self.shoot_range = 5
             self.shoot_anywhere = False
+            self.damage = 1
 
         self.hits = 0
 
@@ -148,6 +240,15 @@ class Ship:
             'shoot_anywhere': getattr(self, 'shoot_anywhere', False),
             'scan_whole_z': getattr(self, 'scan_whole_z', False),
             'ship_type': self.ship_type.value,
+            # Статы новых типов — для клиента и будущей логики.
+            'damage': getattr(self, 'damage', 1),
+            'jump_range': getattr(self, 'jump_range', 0),
+            'heal_range': getattr(self, 'heal_range', 0),
+            'can_phase': getattr(self, 'can_phase', False),
+            'drill_range': getattr(self, 'drill_range', 0),
+            'can_create_hologram': getattr(self, 'can_create_hologram', False),
+            'can_place_mine': getattr(self, 'can_place_mine', False),
+            'mine_damage': getattr(self, 'mine_damage', 0),
         }
 
 

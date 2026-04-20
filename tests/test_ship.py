@@ -37,11 +37,80 @@ class TestShipDefaults:
 
     def test_radio(self):
         s = make(ship_type=ShipType.RADIO)
+        # По ТЗ радиовышка получила hp=3.
+        assert s.max_hits == 3
         assert s.can_shoot is False
         assert s.shoot_range == 0
         assert s.scan_whole_z is True
         # Не должно быть AttributeError при доступе к shoot_anywhere
         assert s.shoot_anywhere is False
+
+
+class TestNewShipTypes:
+    """Статы новых типов по ТЗ (способности пока без логики)."""
+
+    def test_artillery_shoot_anywhere(self):
+        s = make(ship_type=ShipType.ARTILLERY)
+        assert s.shoot_anywhere is True
+        assert s.can_shoot is True
+
+    def test_jumper(self):
+        s = make(ship_type=ShipType.JUMPER)
+        assert s.max_hits == 2
+        assert s.move_range == 3
+        assert s.jump_range == 3
+        assert s.damage == 1
+        assert s.can_shoot is True
+
+    def test_torch(self):
+        s = make(ship_type=ShipType.TORCH)
+        assert s.max_hits == 5
+        assert s.move_range == 1
+        assert s.heal_range == 1
+        assert s.damage == 1
+
+    def test_silence(self):
+        s = make(ship_type=ShipType.SILENCE)
+        assert s.max_hits == 2
+        assert s.move_range == 1
+        assert s.can_phase is True
+        assert s.can_shoot is False
+        assert s.damage == 0
+
+    def test_drill(self):
+        s = make(ship_type=ShipType.DRILL)
+        assert s.max_hits == 4
+        assert s.move_range == 2
+        assert s.drill_range == 3
+        assert s.can_shoot is False
+        assert s.damage == 0
+
+    def test_provocateur(self):
+        s = make(ship_type=ShipType.PROVOCATEUR)
+        assert s.max_hits == 2
+        assert s.move_range == 1
+        assert s.can_create_hologram is True
+        assert s.damage == 1
+
+    def test_spider(self):
+        s = make(ship_type=ShipType.SPIDER)
+        assert s.max_hits == 1
+        assert s.move_range == 1
+        assert s.can_place_mine is True
+        assert s.mine_damage == 2
+        assert s.can_shoot is False
+
+
+class TestToDictNewFields:
+    def test_to_dict_exposes_new_stats(self):
+        s = make(ship_type=ShipType.JUMPER)
+        d = s.to_dict()
+        for key in (
+            'damage', 'jump_range', 'heal_range', 'can_phase',
+            'drill_range', 'can_create_hologram', 'can_place_mine',
+            'mine_damage',
+        ):
+            assert key in d, f"{key} должен быть в to_dict()"
 
 
 class TestMove:
