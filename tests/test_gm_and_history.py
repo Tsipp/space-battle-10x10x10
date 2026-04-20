@@ -156,8 +156,9 @@ class TestHitHistory:
 
     def test_hit_is_recorded(self, server):
         # Расставляем: атакер Team A в (0,0,0), жертва Team B в (1,0,0).
-        attacker = self._find_ship(server, Team.TEAM_A, ShipType.CRUISER)
-        victim = self._find_ship(server, Team.TEAM_B, ShipType.CRUISER)
+        # Крейсер убран из advanced (баланс v3) — используем Артиллерию.
+        attacker = self._find_ship(server, Team.TEAM_A, ShipType.ARTILLERY)
+        victim = self._find_ship(server, Team.TEAM_B, ShipType.ARTILLERY)
         attacker.x, attacker.y, attacker.z = 0, 0, 0
         victim.x, victim.y, victim.z = 1, 0, 0
 
@@ -179,8 +180,8 @@ class TestHitHistory:
         assert entry['turn'] >= 1
 
     def test_history_accumulates_across_turns(self, server):
-        attacker = self._find_ship(server, Team.TEAM_A, ShipType.CRUISER)
-        victim = self._find_ship(server, Team.TEAM_B, ShipType.CRUISER)
+        attacker = self._find_ship(server, Team.TEAM_A, ShipType.ARTILLERY)
+        victim = self._find_ship(server, Team.TEAM_B, ShipType.ARTILLERY)
 
         # Первый ход: стреляем.
         attacker.x, attacker.y, attacker.z = 0, 0, 0
@@ -209,11 +210,11 @@ class TestHitHistory:
         assert second_len > first_len
 
     def test_killed_flag_set_when_ship_dies(self, server):
-        attacker = self._find_ship(server, Team.TEAM_A, ShipType.CRUISER)
-        victim = self._find_ship(server, Team.TEAM_B, ShipType.CRUISER)
+        attacker = self._find_ship(server, Team.TEAM_A, ShipType.ARTILLERY)
+        victim = self._find_ship(server, Team.TEAM_B, ShipType.ARTILLERY)
         attacker.x, attacker.y, attacker.z = 0, 0, 0
         victim.x, victim.y, victim.z = 1, 0, 0
-        # Cruiser max_hits = 1 -> один выстрел убивает.
+        # Артиллерия max_hits = 1, damage = 2 → один выстрел убивает.
         server.actions_received = {
             Team.TEAM_A: [Action(
                 ship_id=attacker.id, action_type=ActionType.SHOOT,

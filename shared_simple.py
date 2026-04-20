@@ -105,7 +105,9 @@ class Ship:
             # разрушает корабль в конечной точке. Атака 1.
             self.max_hits = 2
             self.move_range = 3
-            self.jump_range = 3
+            # Баланс v3: jump_range 3→2 (было имбой, убивал артиллерию в 1 таран
+            # на дальность 3). Сохраняем высокую мобильность за счёт move=3.
+            self.jump_range = 2
             self.can_shoot = True
             self.shoot_range = 5
             self.shoot_anywhere = False
@@ -117,7 +119,9 @@ class Ship:
             # дольше, иначе в прошлых прогонах он получал dmg 367 против 47.
             self.max_hits = 6
             self.move_range = 1
-            self.heal_range = 1
+            # Баланс v3: heal_range 1→2, чтобы Факел реально успевал лечить
+            # больше союзников за один AoE.
+            self.heal_range = 2
             self.can_shoot = True
             self.shoot_range = 5
             self.shoot_anywhere = False

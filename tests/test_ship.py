@@ -60,7 +60,7 @@ class TestNewShipTypes:
         s = make(ship_type=ShipType.JUMPER)
         assert s.max_hits == 2
         assert s.move_range == 3
-        assert s.jump_range == 3
+        assert s.jump_range == 2
         assert s.damage == 1
         assert s.can_shoot is True
 
@@ -69,7 +69,7 @@ class TestNewShipTypes:
         # Баланс v2: hp 5→6.
         assert s.max_hits == 6
         assert s.move_range == 1
-        assert s.heal_range == 1
+        assert s.heal_range == 2
         assert s.damage == 1
 
     def test_silence(self):

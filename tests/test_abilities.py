@@ -32,32 +32,31 @@ def _ship(sid, team, x, y, z, ship_type=ShipType.BASE):
 # ==========================================================================
 
 class TestJumper:
-    def test_jumps_3_cells_through_ships(self, server):
-        """Прыгун может прыгнуть на 3 клетки, даже если между ним и целью
-        стоит другой корабль (обычная коллизия его бы остановила)."""
+    def test_jumps_2_cells_through_ships(self, server):
+        """Баланс v3: Прыгун прыгает на 2 клетки сквозь корабли на пути."""
         jumper = _ship("A1", Team.TEAM_A, 0, 0, 0, ShipType.JUMPER)
         blocker = _ship("A2", Team.TEAM_A, 1, 0, 0, ShipType.BASE)  # свой на пути
         _set_ships(server, [jumper, blocker])
         server.actions_received = {
-            Team.TEAM_A: [Action("A1", ActionType.MOVE, 3, 0, 0)],
+            Team.TEAM_A: [Action("A1", ActionType.MOVE, 2, 0, 0)],
             Team.TEAM_B: [], Team.TEAM_C: [],
         }
         server.process_turn()
-        assert (jumper.x, jumper.y, jumper.z) == (3, 0, 0)
+        assert (jumper.x, jumper.y, jumper.z) == (2, 0, 0)
         assert blocker.alive, "Свой корабль на пути не должен пострадать"
 
     def test_jumper_rams_enemy_at_destination(self, server):
         """Прыгун приземляется на вражескую клетку — враг мгновенно погибает."""
         jumper = _ship("A1", Team.TEAM_A, 0, 0, 0, ShipType.JUMPER)
-        enemy = _ship("B1", Team.TEAM_B, 3, 0, 0, ShipType.CRUISER)
+        enemy = _ship("B1", Team.TEAM_B, 2, 0, 0, ShipType.ARTILLERY)
         _set_ships(server, [jumper, enemy])
         server.actions_received = {
-            Team.TEAM_A: [Action("A1", ActionType.MOVE, 3, 0, 0)],
+            Team.TEAM_A: [Action("A1", ActionType.MOVE, 2, 0, 0)],
             Team.TEAM_B: [], Team.TEAM_C: [],
         }
         server.process_turn()
         assert not enemy.alive, "Враг на посадочной клетке должен быть уничтожен тараном"
-        assert (jumper.x, jumper.y, jumper.z) == (3, 0, 0)
+        assert (jumper.x, jumper.y, jumper.z) == (2, 0, 0)
         # Таран должен попасть в hit_history
         ram_events = [h for h in server.game_state['hit_history'] if h.get('ram')]
         assert ram_events, "Таран Прыгуна должен записаться в hit_history"
@@ -65,22 +64,26 @@ class TestJumper:
     def test_jumper_cannot_land_on_ally(self, server):
         """Прыгун не может приземлиться на своего — движение отклонено."""
         jumper = _ship("A1", Team.TEAM_A, 0, 0, 0, ShipType.JUMPER)
-        ally = _ship("A2", Team.TEAM_A, 3, 0, 0, ShipType.BASE)
+        ally = _ship("A2", Team.TEAM_A, 2, 0, 0, ShipType.BASE)
         _set_ships(server, [jumper, ally])
         server.actions_received = {
-            Team.TEAM_A: [Action("A1", ActionType.MOVE, 3, 0, 0)],
+            Team.TEAM_A: [Action("A1", ActionType.MOVE, 2, 0, 0)],
             Team.TEAM_B: [], Team.TEAM_C: [],
         }
         server.process_turn()
         assert (jumper.x, jumper.y, jumper.z) == (0, 0, 0), "Ход должен быть отклонён"
         assert ally.alive
 
-    def test_jumper_range_4_rejected(self, server):
-        """Дальше 3 клеток — нельзя."""
+    def test_jumper_range_3_rejected_if_blocker(self, server):
+        """Баланс v3: jump_range=2 — прыжок сквозь корабли ограничен 2 клетками.
+        Обычный move=3 (без препятствий) остаётся разрешён: jump_range режет
+        только прыжок сквозь preграды."""
         jumper = _ship("A1", Team.TEAM_A, 0, 0, 0, ShipType.JUMPER)
-        _set_ships(server, [jumper])
+        blocker = _ship("A2", Team.TEAM_A, 1, 0, 0, ShipType.BASE)
+        _set_ships(server, [jumper, blocker])
+        # Прыжок через союзника на дистанцию 3 — превышает jump_range=2.
         server.actions_received = {
-            Team.TEAM_A: [Action("A1", ActionType.MOVE, 4, 0, 0)],
+            Team.TEAM_A: [Action("A1", ActionType.MOVE, 3, 0, 0)],
             Team.TEAM_B: [], Team.TEAM_C: [],
         }
         server.process_turn()

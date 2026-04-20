@@ -192,25 +192,48 @@ class TeamBot:
 
     # --- shoot helpers -------------------------------------------------------
 
-    def _pick_shoot_target(self, ship, enemies):
-        """Ищет врага, по которому данный корабль реально может выстрелить.
+    def _target_score(self, ship, enemy):
+        """Оценка полезности врага как цели стрельбы. Выше — лучше.
 
-        При равной дистанции выбор рандомизирован rng, чтобы партии
-        с разными сидами ветвились по-разному.
+        Баланс v3: «максимально эффективно» — сначала добиваем, потом бьём
+        наиболее опасных, потом ближних.
+          + 1000  — наш выстрел убивает врага (damage >= hp_left).
+          + damage_output × 10 — более опасные враги (с высоким damage)
+            в приоритете над безопасными (Радиовышка, Тишина, Провокатор,
+            Паук — damage=0 → сильно проседают).
+          +  (max_hits − hp_left) × 5 — уже подранены, шаг до убийства.
+          −  Chebyshev-дистанция — ближних чуть предпочитаем.
         """
+        hp_left = max(0, enemy.max_hits - enemy.hits)
+        dmg = getattr(enemy, 'damage', 0) or 0
+        dist = max(abs(enemy.x - ship.x), abs(enemy.y - ship.y), abs(enemy.z - ship.z))
+        will_kill = ship.damage >= hp_left and hp_left > 0
+        score = 0.0
+        if will_kill:
+            score += 1000
+        score += dmg * 10
+        score += (enemy.max_hits - hp_left) * 5
+        score -= dist
+        # Голограмма — всегда умирает с 1 хита, но не опасна. Добиваем
+        # только если ничего лучше нет: даём низкий базовый score.
+        if getattr(enemy, 'is_hologram', False):
+            score -= 100
+        return score
+
+    def _pick_shoot_target(self, ship, enemies):
+        """Выбирает лучшую цель по scoring-функции. Возвращает корабль или None."""
         if not ship.can_shoot or not enemies:
             return None
-
-        def _dist(e):
-            return max(abs(e.x - ship.x), abs(e.y - ship.y), abs(e.z - ship.z))
-
-        shuffled = list(enemies)
-        self.rng.shuffle(shuffled)
-        ordered = sorted(shuffled, key=_dist)
-        for enemy in ordered:
-            if ship.can_shoot_at(enemy.x, enemy.y, enemy.z):
-                return enemy
-        return None
+        reachable = [e for e in enemies if ship.can_shoot_at(e.x, e.y, e.z)]
+        if not reachable:
+            return None
+        # Детерминированная ранжировка; ранее использовался rng.shuffle —
+        # теперь приоритет задаёт scoring, а rng нужен только для tie-break.
+        reachable.sort(
+            key=lambda e: (self._target_score(ship, e), self.rng.random()),
+            reverse=True,
+        )
+        return reachable[0]
 
     # --- move helpers --------------------------------------------------------
 
@@ -341,24 +364,43 @@ class TeamBot:
         predicted_enemy_cells = predicted_enemy_cells or {}
         all_ships = all_ships or {}
         # ---- Способности нестандартных кораблей (только в advanced) --------
-        # Тишина: вошёл в фазу, если ранен; выходит, когда полностью здоров.
+        # Тишина: вход в фазу по реальной угрозе, выход — когда угрозы нет.
+        #   • enter PHASE, если виден хотя бы один вражеский стрелок в пределах
+        #     5 клеток (дальность выстрела), т.е. нас могут подстрелить в
+        #     следующем ходу.
+        #   • exit PHASE, если ни одного такого стрелка не видно и мы здоровы.
+        # Baseline v2 фазировалась «если ранена» — это давало мало пользы:
+        # корабль в фазе бесполезен (не стреляет ни во что — у Тишины damage=0,
+        # но в coffee будущем если дадим — важно, чтобы её не плющили).
         if getattr(ship, 'can_phase', False):
-            if ship.is_phased and ship.hits == 0:
+            threatening = [
+                e for e in visible_ships
+                if getattr(e, 'can_shoot', False)
+                and max(abs(e.x - ship.x), abs(e.y - ship.y), abs(e.z - ship.z))
+                    <= getattr(e, 'shoot_range', 0)
+            ]
+            if threatening and not ship.is_phased:
                 return Action(ship.id, ActionType.PHASE)
-            if not ship.is_phased and ship.hits > 0:
+            if not threatening and ship.is_phased and ship.hits == 0:
+                # Угрозы нет и мы здоровы — выйти, чтобы не торчать бесполезно.
                 return Action(ship.id, ActionType.PHASE)
-            # Если ранен и уже в фазе — двигаемся к союзнику-Факелу.
-            # Здоров и не в фазе — обычное поведение ниже.
+            # В фазе и ранены: продолжаем держаться, обычное move-поведение
+            # всё равно доступно (в фазе можно ходить, нельзя только быть
+            # целью выстрелов).
 
         # Факел: лечит, если рядом есть раненый союзник (включая себя).
+        # Максимально эффективно: если в радиусе heal_range есть хотя бы один
+        # раненый — лечим (AoE лечит всех сразу на 1 hp). Если раненых нет,
+        # но есть раненые вне радиуса — ниже по коду Факел пойдёт к ним
+        # (обрабатывается в блоке «движение к раненому»).
         if getattr(ship, 'heal_range', 0) > 0:
-            has_wounded_ally = any(
-                ally.alive and ally.hits > 0
+            wounded_in_range = [
+                ally for ally in my_ships
+                if ally.alive and ally.hits > 0
                 and max(abs(ally.x - ship.x), abs(ally.y - ship.y), abs(ally.z - ship.z))
                     <= ship.heal_range
-                for ally in my_ships
-            )
-            if has_wounded_ally:
+            ]
+            if wounded_in_range:
                 return Action(ship.id, ActionType.HEAL)
 
         # Провокатор: ставит голограмму в соседнюю клетку в сторону ближайшего
@@ -440,25 +482,48 @@ class TeamBot:
                             ship.id, ActionType.MINE, tx, ty, tz
                         )
 
-        # Прыгун: если видит врага в радиусе jump_range — прыгает и убивает
-        # его тараном.
+        # Прыгун: прыжок-таран = мгновенное убийство любой цели в радиусе
+        # jump_range. Максимально эффективно — выбираем самого опасного
+        # (damage), затем самого живого (hp_left), чтобы не тратить таран
+        # на полуживого Паука, если рядом есть полноценная Артиллерия.
         if getattr(ship, 'jump_range', 0) > 0 and visible_ships:
+            jump_candidates = []
             for enemy in visible_ships:
+                if getattr(enemy, 'is_phased', False):
+                    continue
+                if getattr(enemy, 'is_hologram', False):
+                    continue
                 d = max(
                     abs(enemy.x - ship.x), abs(enemy.y - ship.y), abs(enemy.z - ship.z)
                 )
-                if 1 <= d <= ship.jump_range and not getattr(enemy, 'is_phased', False):
-                    # Союзник в целевой клетке блокирует; редкий случай, но
-                    # проверяем.
-                    if (enemy.x, enemy.y, enemy.z) not in reserved:
-                        return Action(
-                            ship.id, ActionType.MOVE, enemy.x, enemy.y, enemy.z
-                        )
+                if not (1 <= d <= ship.jump_range):
+                    continue
+                if (enemy.x, enemy.y, enemy.z) in reserved:
+                    continue
+                # Приоритет: damage ↓ (сильнее — важнее убрать),
+                # hp_left ↓ (полноценный важнее ослабленного),
+                # dist ↑ (при прочих равных — ближний, быстрее реагируем).
+                score = (
+                    (getattr(enemy, 'damage', 0) or 0) * 100
+                    + (enemy.max_hits - enemy.hits) * 10
+                    - d
+                )
+                jump_candidates.append((score, enemy))
+            if jump_candidates:
+                jump_candidates.sort(key=lambda t: t[0], reverse=True)
+                best_enemy = jump_candidates[0][1]
+                return Action(
+                    ship.id, ActionType.MOVE, best_enemy.x, best_enemy.y, best_enemy.z
+                )
 
-        # Бурав: если видит врага по одной оси в радиусе drill_range —
-        # движется тараном.
+        # Бурав: такая же логика приоритета, но только по одной оси.
         if getattr(ship, 'drill_range', 0) > 0 and visible_ships:
+            drill_candidates = []
             for enemy in visible_ships:
+                if getattr(enemy, 'is_phased', False):
+                    continue
+                if getattr(enemy, 'is_hologram', False):
+                    continue
                 axes = (
                     (1 if enemy.x != ship.x else 0)
                     + (1 if enemy.y != ship.y else 0)
@@ -467,12 +532,22 @@ class TeamBot:
                 d = max(
                     abs(enemy.x - ship.x), abs(enemy.y - ship.y), abs(enemy.z - ship.z)
                 )
-                if axes == 1 and 1 <= d <= ship.drill_range \
-                        and not getattr(enemy, 'is_phased', False):
-                    if (enemy.x, enemy.y, enemy.z) not in reserved:
-                        return Action(
-                            ship.id, ActionType.MOVE, enemy.x, enemy.y, enemy.z
-                        )
+                if not (axes == 1 and 1 <= d <= ship.drill_range):
+                    continue
+                if (enemy.x, enemy.y, enemy.z) in reserved:
+                    continue
+                score = (
+                    (getattr(enemy, 'damage', 0) or 0) * 100
+                    + (enemy.max_hits - enemy.hits) * 10
+                    - d
+                )
+                drill_candidates.append((score, enemy))
+            if drill_candidates:
+                drill_candidates.sort(key=lambda t: t[0], reverse=True)
+                best_enemy = drill_candidates[0][1]
+                return Action(
+                    ship.id, ActionType.MOVE, best_enemy.x, best_enemy.y, best_enemy.z
+                )
 
         # ---- Классическая стратегия ---------------------------------------
         # 1) Стрельба
@@ -507,23 +582,17 @@ class TeamBot:
                 )
 
         # 2) Движение (учтём расширенный радиус у Прыгуна/Бурава).
-        effective_move = max(
-            ship.move_range,
-            getattr(ship, 'jump_range', 0),
-            getattr(ship, 'drill_range', 0),
-        )
+        # Для Прыгуна jump_range — это авторитетная дальность хода
+        # (серверный nerf v3), поэтому берём не max, а именно её.
+        if getattr(ship, 'jump_range', 0) > 0:
+            effective_move = ship.jump_range
+        else:
+            effective_move = max(
+                ship.move_range,
+                getattr(ship, 'drill_range', 0),
+            )
         if effective_move > 0:
-            if visible_ships:
-                anchor = min(
-                    visible_ships,
-                    key=lambda e: max(
-                        abs(e.x - ship.x), abs(e.y - ship.y), abs(e.z - ship.z)
-                    ),
-                )
-                tx, ty, tz = anchor.x, anchor.y, anchor.z
-            else:
-                tx, ty, tz = 5, 5, 5
-
+            tx, ty, tz = self._pick_move_target(ship, visible_ships, my_ships, all_ships)
             step = self._step_toward(
                 ship.x, ship.y, ship.z, tx, ty, tz, reserved
             )
@@ -537,6 +606,63 @@ class TeamBot:
             )
 
         return None
+
+    def _pick_move_target(self, ship, visible_ships, my_ships, all_ships):
+        """Выбирает точку-«якорь», к которой корабль будет двигаться.
+
+        Максимально эффективное поведение:
+          • Факел (heal_range>0): идёт к раненому союзнику вне радиуса.
+            Если все здоровы — становится рядом с самым «дорогим» союзником
+            (у которого max_hits больше среднего), чтобы быть готовым лечить.
+          • Радиовышка (can_shoot=False, scan_whole_z): движется к центру
+            «неотсканированного» пространства — Z, отличный от союзной
+            Радиовышки и дальний от врагов.
+          • Все остальные: идут к ближайшему видимому врагу; если никого не
+            видно — к самому «свежему» last_known_enemies или в центр карты.
+        """
+        # --- Факел: приоритет — раненые союзники ---
+        if getattr(ship, 'heal_range', 0) > 0:
+            wounded = [a for a in my_ships if a.alive and a.hits > 0 and a.id != ship.id]
+            if wounded:
+                # Наиболее раненый (по доле hp_lost/max_hits) в первую очередь.
+                wounded.sort(
+                    key=lambda a: (a.hits / max(1, a.max_hits), -max(
+                        abs(a.x - ship.x), abs(a.y - ship.y), abs(a.z - ship.z)
+                    )),
+                    reverse=True,
+                )
+                return wounded[0].x, wounded[0].y, wounded[0].z
+            # Нет раненых: держимся рядом с самым «дорогим» союзником.
+            valuable_allies = [a for a in my_ships if a.alive and a.id != ship.id]
+            if valuable_allies:
+                # Приоритет — корабли с высокой атакой (Артиллерия, Прыгун).
+                valuable_allies.sort(
+                    key=lambda a: (getattr(a, 'damage', 0), a.max_hits),
+                    reverse=True,
+                )
+                anchor = valuable_allies[0]
+                return anchor.x, anchor.y, anchor.z
+
+        # --- Обычное поведение: ближайший видимый враг ---
+        if visible_ships:
+            anchor = min(
+                visible_ships,
+                key=lambda e: max(
+                    abs(e.x - ship.x), abs(e.y - ship.y), abs(e.z - ship.z)
+                ),
+            )
+            return anchor.x, anchor.y, anchor.z
+
+        # --- Никого не видим: идём к свежайшему last-known врагу ---
+        if self.last_known_enemies:
+            freshest = min(
+                self.last_known_enemies.items(),
+                key=lambda kv: kv[1][3],  # age
+            )
+            _, (ex, ey, ez, _) = freshest
+            return ex, ey, ez
+
+        return 5, 5, 5
 
 
 # ---------------------------------------------------------------------------

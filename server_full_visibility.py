@@ -669,38 +669,36 @@ class GameServer:
             # Продвинутый режим - разные типы
             self.log("🚀 Продвинутый режим: создаю разные типы кораблей", 'success')
             
-            # Команда A — стартует на грани x=0 (Базовый корабль убран из advanced)
-            ships["A_1"] = Ship("A_1", "Крейсер A1", Team.TEAM_A, 0, 0, 0, ShipType.CRUISER)
-            ships["A_2"] = Ship("A_2", "Артиллерия A2", Team.TEAM_A, 0, 2, 0, ShipType.ARTILLERY)
-            ships["A_3"] = Ship("A_3", "Радиовышка A3", Team.TEAM_A, 0, 4, 0, ShipType.RADIO)
-            ships["A_4"] = Ship("A_4", "Прыгун A4", Team.TEAM_A, 0, 6, 0, ShipType.JUMPER)
-            ships["A_5"] = Ship("A_5", "Факел A5", Team.TEAM_A, 0, 8, 0, ShipType.TORCH)
-            ships["A_6"] = Ship("A_6", "Тишина A6", Team.TEAM_A, 0, 1, 1, ShipType.SILENCE)
-            ships["A_7"] = Ship("A_7", "Бурав A7", Team.TEAM_A, 0, 3, 1, ShipType.DRILL)
-            ships["A_8"] = Ship("A_8", "Провокатор A8", Team.TEAM_A, 0, 5, 1, ShipType.PROVOCATEUR)
-            ships["A_9"] = Ship("A_9", "Паук A9", Team.TEAM_A, 0, 7, 1, ShipType.SPIDER)
+            # Команда A — стартует на грани x=0
+            # (Базовый и Крейсер убраны из advanced — Крейсер и есть «базовый».)
+            ships["A_1"] = Ship("A_1", "Артиллерия A1", Team.TEAM_A, 0, 0, 0, ShipType.ARTILLERY)
+            ships["A_2"] = Ship("A_2", "Радиовышка A2", Team.TEAM_A, 0, 2, 0, ShipType.RADIO)
+            ships["A_3"] = Ship("A_3", "Прыгун A3", Team.TEAM_A, 0, 4, 0, ShipType.JUMPER)
+            ships["A_4"] = Ship("A_4", "Факел A4", Team.TEAM_A, 0, 6, 0, ShipType.TORCH)
+            ships["A_5"] = Ship("A_5", "Тишина A5", Team.TEAM_A, 0, 8, 0, ShipType.SILENCE)
+            ships["A_6"] = Ship("A_6", "Бурав A6", Team.TEAM_A, 0, 1, 1, ShipType.DRILL)
+            ships["A_7"] = Ship("A_7", "Провокатор A7", Team.TEAM_A, 0, 3, 1, ShipType.PROVOCATEUR)
+            ships["A_8"] = Ship("A_8", "Паук A8", Team.TEAM_A, 0, 5, 1, ShipType.SPIDER)
 
             # Команда B — стартует на грани x=9
-            ships["B_1"] = Ship("B_1", "Крейсер B1", Team.TEAM_B, 9, 9, 9, ShipType.CRUISER)
-            ships["B_2"] = Ship("B_2", "Артиллерия B2", Team.TEAM_B, 9, 7, 9, ShipType.ARTILLERY)
-            ships["B_3"] = Ship("B_3", "Радиовышка B3", Team.TEAM_B, 9, 5, 9, ShipType.RADIO)
-            ships["B_4"] = Ship("B_4", "Прыгун B4", Team.TEAM_B, 9, 3, 9, ShipType.JUMPER)
-            ships["B_5"] = Ship("B_5", "Факел B5", Team.TEAM_B, 9, 1, 9, ShipType.TORCH)
-            ships["B_6"] = Ship("B_6", "Тишина B6", Team.TEAM_B, 9, 8, 8, ShipType.SILENCE)
-            ships["B_7"] = Ship("B_7", "Бурав B7", Team.TEAM_B, 9, 6, 8, ShipType.DRILL)
-            ships["B_8"] = Ship("B_8", "Провокатор B8", Team.TEAM_B, 9, 4, 8, ShipType.PROVOCATEUR)
-            ships["B_9"] = Ship("B_9", "Паук B9", Team.TEAM_B, 9, 2, 8, ShipType.SPIDER)
+            ships["B_1"] = Ship("B_1", "Артиллерия B1", Team.TEAM_B, 9, 9, 9, ShipType.ARTILLERY)
+            ships["B_2"] = Ship("B_2", "Радиовышка B2", Team.TEAM_B, 9, 7, 9, ShipType.RADIO)
+            ships["B_3"] = Ship("B_3", "Прыгун B3", Team.TEAM_B, 9, 5, 9, ShipType.JUMPER)
+            ships["B_4"] = Ship("B_4", "Факел B4", Team.TEAM_B, 9, 3, 9, ShipType.TORCH)
+            ships["B_5"] = Ship("B_5", "Тишина B5", Team.TEAM_B, 9, 1, 9, ShipType.SILENCE)
+            ships["B_6"] = Ship("B_6", "Бурав B6", Team.TEAM_B, 9, 8, 8, ShipType.DRILL)
+            ships["B_7"] = Ship("B_7", "Провокатор B7", Team.TEAM_B, 9, 6, 8, ShipType.PROVOCATEUR)
+            ships["B_8"] = Ship("B_8", "Паук B8", Team.TEAM_B, 9, 4, 8, ShipType.SPIDER)
 
             # Команда C — стартует на грани y=9
-            ships["C_1"] = Ship("C_1", "Крейсер C1", Team.TEAM_C, 4, 9, 4, ShipType.CRUISER)
-            ships["C_2"] = Ship("C_2", "Артиллерия C2", Team.TEAM_C, 5, 9, 4, ShipType.ARTILLERY)
-            ships["C_3"] = Ship("C_3", "Радиовышка C3", Team.TEAM_C, 6, 9, 4, ShipType.RADIO)
-            ships["C_4"] = Ship("C_4", "Прыгун C4", Team.TEAM_C, 7, 9, 4, ShipType.JUMPER)
-            ships["C_5"] = Ship("C_5", "Факел C5", Team.TEAM_C, 8, 9, 4, ShipType.TORCH)
-            ships["C_6"] = Ship("C_6", "Тишина C6", Team.TEAM_C, 4, 9, 5, ShipType.SILENCE)
-            ships["C_7"] = Ship("C_7", "Бурав C7", Team.TEAM_C, 5, 9, 5, ShipType.DRILL)
-            ships["C_8"] = Ship("C_8", "Провокатор C8", Team.TEAM_C, 6, 9, 5, ShipType.PROVOCATEUR)
-            ships["C_9"] = Ship("C_9", "Паук C9", Team.TEAM_C, 7, 9, 5, ShipType.SPIDER)
+            ships["C_1"] = Ship("C_1", "Артиллерия C1", Team.TEAM_C, 4, 9, 4, ShipType.ARTILLERY)
+            ships["C_2"] = Ship("C_2", "Радиовышка C2", Team.TEAM_C, 5, 9, 4, ShipType.RADIO)
+            ships["C_3"] = Ship("C_3", "Прыгун C3", Team.TEAM_C, 6, 9, 4, ShipType.JUMPER)
+            ships["C_4"] = Ship("C_4", "Факел C4", Team.TEAM_C, 7, 9, 4, ShipType.TORCH)
+            ships["C_5"] = Ship("C_5", "Тишина C5", Team.TEAM_C, 8, 9, 4, ShipType.SILENCE)
+            ships["C_6"] = Ship("C_6", "Бурав C6", Team.TEAM_C, 4, 9, 5, ShipType.DRILL)
+            ships["C_7"] = Ship("C_7", "Провокатор C7", Team.TEAM_C, 6, 9, 5, ShipType.PROVOCATEUR)
+            ships["C_8"] = Ship("C_8", "Паук C8", Team.TEAM_C, 7, 9, 5, ShipType.SPIDER)
         
         self.game_state['ships'] = ships
         self.log(f"✅ Создано {len(ships)} кораблей", 'success')
@@ -1615,8 +1613,12 @@ class GameServer:
         is_drill = ship.ship_type == ShipType.DRILL and ship.drill_range > 0
 
         effective_range = ship.move_range
+        # Баланс v3: для Прыгуна jump_range — АВТОРИТЕТНАЯ дальность хода
+        # (не max с move_range), чтобы nerf jump_range=2 действительно бил по
+        # Прыгуну. move_range у него остаётся 3 только как нижняя граница,
+        # но верхняя планка — jump_range.
         if is_jumper:
-            effective_range = max(effective_range, ship.jump_range)
+            effective_range = ship.jump_range
         if is_drill:
             effective_range = max(effective_range, ship.drill_range)
 
