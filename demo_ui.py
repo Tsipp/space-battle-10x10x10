@@ -158,6 +158,29 @@ def _demo_history():
     ]
 
 
+def run_legend():
+    """Демо: модальная справка по типам кораблей."""
+    root = Tk()
+    apply_theme(root)
+    root.title("demo: легенда")
+    root.configure(bg=Palette().bg_root)
+    root.geometry("200x60+1200+20")
+
+    class _Mock:
+        colors = {
+            'panel': Palette().bg_panel, 'accent1': Palette().accent_info,
+            'accent3': Palette().accent_success,
+        }
+        root = None
+        open_legend = GameClientGUI.open_legend
+        _render_legend_card = GameClientGUI._render_legend_card
+
+    m = _Mock()
+    m.root = root
+    m.open_legend()
+    root.mainloop()
+
+
 def run_hud():
     """Демо: HUD-панель (ход/фаза/плашки команд)."""
     root = Tk()
@@ -242,6 +265,8 @@ if __name__ == "__main__":
         run_log()
     elif cmd == "hud":
         run_hud()
+    elif cmd == "legend":
+        run_legend()
     else:
         print(f"unknown demo '{cmd}'", file=sys.stderr)
         sys.exit(2)

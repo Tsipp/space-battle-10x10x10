@@ -673,6 +673,141 @@ class GameClientGUI:
         # Нижняя панель с кнопками
         self.create_button_panel()
     
+    def open_legend(self):
+        """Модальное окно со справкой по всем типам кораблей."""
+        pal = Palette()
+        fnt = Fonts()
+
+        if getattr(self, "_legend_window", None) is not None:
+            try:
+                if self._legend_window.winfo_exists():
+                    self._legend_window.lift()
+                    self._legend_window.focus_force()
+                    return
+            except Exception:
+                pass
+
+        win = Toplevel(self.root)
+        win.title("Справка · Типы кораблей")
+        win.configure(bg=pal.bg_root)
+        win.geometry("760x620")
+        win.transient(self.root)
+        self._legend_window = win
+
+        # Заголовок.
+        head = Frame(win, bg=pal.bg_root)
+        head.pack(fill=X, padx=20, pady=(16, 8))
+        Label(head, text="📖 Справочник по типам кораблей",
+              bg=pal.bg_root, fg=pal.fg_title, font=fnt.h1).pack(side=LEFT)
+        Button(head, text="✕", width=3, bg=pal.bg_root, fg=pal.fg_secondary,
+               activebackground=pal.bg_panel, activeforeground=pal.fg_title,
+               bd=0, relief=FLAT, font=fnt.h3, cursor="hand2",
+               command=win.destroy).pack(side=RIGHT)
+
+        # Прокручиваемый контейнер для карточек типов.
+        canvas = Canvas(win, bg=pal.bg_root, highlightthickness=0, bd=0)
+        canvas.pack(side=LEFT, fill=BOTH, expand=True, padx=(20, 0), pady=4)
+        sb = ttk.Scrollbar(win, orient=VERTICAL, command=canvas.yview)
+        sb.pack(side=RIGHT, fill=Y, padx=(0, 20), pady=4)
+        canvas.configure(yscrollcommand=sb.set)
+
+        inner = Frame(canvas, bg=pal.bg_root)
+        inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.bind(
+            "<Configure>",
+            lambda e, c=canvas, i=inner_id: c.itemconfigure(i, width=e.width),
+        )
+        # Мышь-колёсико.
+        for wheel_ev in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            canvas.bind_all(
+                wheel_ev,
+                lambda e, c=canvas: c.yview_scroll(
+                    -1 if getattr(e, "delta", 0) > 0 or getattr(e, "num", 0) == 4 else 1,
+                    "units",
+                ),
+            )
+        win.protocol(
+            "WM_DELETE_WINDOW",
+            lambda c=canvas, w=win: (
+                [c.unbind_all(e) for e in ("<MouseWheel>", "<Button-4>", "<Button-5>")],
+                w.destroy(),
+            ),
+        )
+
+        # Порядок — как в SHIP_TYPE_INFO (кроме «Базовый»).
+        order = ["Прыгун", "Артиллерия", "Бурав", "Факел", "Тишина",
+                 "Провокатор", "Паук", "Радиовышка", "Крейсер"]
+        for typ in order:
+            info = SHIP_TYPE_INFO.get(typ)
+            if not info:
+                continue
+            self._render_legend_card(inner, typ, info, pal, fnt)
+
+        # Футер — краткие правила.
+        footer = Frame(win, bg=pal.bg_root)
+        footer.pack(fill=X, padx=20, pady=(6, 14))
+        Label(
+            footer,
+            text=("🏁 Победа: уничтожить корабли всех других команд. "
+                  "При таймауте (30 ходов) — побеждает команда с бо́льшим уроном."),
+            bg=pal.bg_root, fg=pal.fg_secondary, font=fnt.small,
+            justify=LEFT, wraplength=700,
+        ).pack(side=LEFT, fill=X, expand=True)
+
+        win.bind("<Escape>", lambda _e: win.destroy())
+        win.focus_force()
+
+    def _render_legend_card(self, parent, ship_type, info, pal, fnt):
+        """Одна карточка описания типа корабля в модалке справки."""
+        accent = info.get("accent", pal.fg_primary)
+        card = Frame(parent, bg=pal.bg_card, bd=0, relief=FLAT,
+                     highlightbackground=pal.border, highlightthickness=1)
+        card.pack(fill=X, padx=4, pady=4)
+
+        # Левая полоска-акцент.
+        Frame(card, bg=accent, width=5).pack(side=LEFT, fill=Y)
+
+        body = Frame(card, bg=pal.bg_card)
+        body.pack(side=LEFT, fill=BOTH, expand=True, padx=10, pady=8)
+
+        head = Frame(body, bg=pal.bg_card)
+        head.pack(fill=X)
+        Label(head, text=info.get("icon", "🛰"),
+              bg=pal.bg_card, fg=accent, font=fnt.h1).pack(side=LEFT)
+        Label(head, text=f"  {ship_type}",
+              bg=pal.bg_card, fg=pal.fg_title, font=fnt.h2).pack(side=LEFT)
+        role = info.get("role", "")
+        if role:
+            Label(head, text=f"  · {role}",
+                  bg=pal.bg_card, fg=pal.fg_secondary, font=fnt.small
+                  ).pack(side=LEFT)
+
+        # Статы.
+        stats = info.get("stats") or {}
+        if stats:
+            st = Frame(body, bg=pal.bg_card)
+            st.pack(fill=X, pady=(4, 2))
+            for k, v in stats.items():
+                pill = Frame(st, bg=pal.bg_panel, bd=0)
+                pill.pack(side=LEFT, padx=(0, 6))
+                Label(pill, text=f"{k}", bg=pal.bg_panel,
+                      fg=pal.fg_muted, font=fnt.small,
+                      ).pack(side=LEFT, padx=(6, 2), pady=2)
+                Label(pill, text=f"{v}", bg=pal.bg_panel,
+                      fg=pal.fg_primary, font=fnt.small_bold,
+                      ).pack(side=LEFT, padx=(0, 6), pady=2)
+
+        # Способности — bullet-список.
+        for line in (info.get("abilities") or []):
+            Label(body, text=f"• {line}", bg=pal.bg_card,
+                  fg=pal.fg_primary, font=fnt.small,
+                  justify=LEFT, wraplength=640, anchor=W
+                  ).pack(fill=X, anchor=W)
+
     def create_info_panel(self):
         """HUD-панель: ход, фаза, плашки команд (живые/урон/киллы)."""
         pal = Palette()
@@ -719,6 +854,16 @@ class GameClientGUI:
         # --- Правая секция: плашки 3 команд ---------------------------- #
         right = Frame(hud, bg=pal.bg_panel)
         right.pack(side=RIGHT, fill=Y, padx=10, pady=6)
+
+        # Кнопка «?»-справки — самая правая.
+        help_btn = Button(
+            right, text="?", width=3, bg=pal.bg_card, fg=pal.accent_info,
+            activebackground=pal.border_strong, activeforeground=pal.fg_title,
+            font=fnt.h3, bd=0, relief=FLAT, cursor="hand2",
+            command=self.open_legend,
+        )
+        help_btn.grid(row=0, column=99, padx=(10, 0), sticky=NS)
+        Tooltip(help_btn, lambda: "Справка по типам кораблей")
 
         self._team_pill_widgets = {}
         for i, team_name in enumerate(("Team A", "Team B", "Team C")):
