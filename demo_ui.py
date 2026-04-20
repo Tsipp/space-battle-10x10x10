@@ -255,6 +255,99 @@ def run_log():
     root.mainloop()
 
 
+def run_gm():
+    """Демо: панель гейммастера с мок-состоянием сервера."""
+    import time
+    from game_master_gui import GameMasterGUI
+
+    gui = GameMasterGUI()
+    # Закрываем окно подключения — работаем в офлайн-режиме.
+    for w in gui.root.winfo_children():
+        if isinstance(w, Toplevel):
+            w.destroy()
+
+    # Собираем максимально показательное состояние.
+    ships = {}
+    # Team A на z=4.
+    a_line = [
+        ("Артиллерия A1", "Артиллерия", 2, 3, 4, 0, 1),
+        ("Прыгун A2", "Прыгун", 3, 3, 4, 0, 2),
+        ("Факел A3", "Факел", 4, 3, 4, 1, 6),
+        ("Тишина A4", "Тишина", 5, 3, 4, 0, 2),
+        ("Бурав A5", "Бурав", 6, 3, 4, 1, 2),
+        ("Провокатор A6", "Провокатор", 7, 3, 4, 0, 2),
+        ("Паук A7", "Паук", 8, 3, 4, 2, 3),
+        ("Радиовышка A8", "Радиовышка", 3, 4, 4, 0, 2),
+    ]
+    for i, (nm, tp, x, y, z, h, mh) in enumerate(a_line):
+        ships[f"A{i+1}"] = {
+            "id": f"A{i+1}", "name": nm, "type": tp, "team": "Team A",
+            "x": x, "y": y, "z": z, "alive": True, "hits": h,
+            "max_hits": mh, "is_phased": tp == "Тишина",
+        }
+    # Team B на z=4 (часть видима на карте).
+    b_line = [
+        ("Прыгун B1", "Прыгун", 4, 6, 4, 0, 2),
+        ("Артиллерия B2", "Артиллерия", 3, 7, 4, 0, 1),
+        ("Тишина B3", "Тишина", 6, 6, 4, 0, 2, True),
+        ("Бурав B4", "Бурав", 5, 8, 4, 0, 2),
+    ]
+    for i, row in enumerate(b_line):
+        nm, tp, x, y, z, h, mh = row[:7]
+        ships[f"B{i+1}"] = {
+            "id": f"B{i+1}", "name": nm, "type": tp, "team": "Team B",
+            "x": x, "y": y, "z": z, "alive": True, "hits": h,
+            "max_hits": mh, "is_phased": tp == "Тишина",
+        }
+    # Team C: пара — один убит.
+    ships["C1"] = {
+        "id": "C1", "name": "Бурав C1", "type": "Бурав", "team": "Team C",
+        "x": 7, "y": 5, "z": 4, "alive": True, "hits": 1, "max_hits": 2,
+    }
+    ships["C2"] = {
+        "id": "C2", "name": "Провокатор C2", "type": "Провокатор",
+        "team": "Team C",
+        "x": 8, "y": 6, "z": 4, "alive": False, "hits": 2, "max_hits": 2,
+    }
+
+    history = [
+        {"turn": 1, "kind": "hit", "attacker": "Team A", "target": "Team B",
+         "attacker_name": "Артиллерия A1", "target_name": "Прыгун B1",
+         "position": "(4,6,4)", "damage": 1, "killed": False},
+        {"turn": 2, "kind": "ram", "attacker": "Team A", "target": "Team C",
+         "attacker_name": "Прыгун A2", "target_name": "Провокатор C2",
+         "position": "(8,6,4)", "damage": 2, "killed": True},
+        {"turn": 3, "kind": "mine", "attacker": "Team A", "target": "Team B",
+         "attacker_name": "Паук A7", "target_name": "Прыгун B1",
+         "position": "(5,7,4)", "damage": 2, "killed": False},
+    ]
+
+    state = {
+        "turn": 7, "turn_limit": 30, "phase": "planning",
+        "planning_deadline": time.time() + 22,
+        "actions_received_teams": ["Team A", "Team B"],
+        "connected_teams": ["Team A", "Team B", "Team C"],
+        "all_ships": ships,
+        "hit_history": history,
+        "game_over": False,
+        "message": "идёт планирование",
+    }
+    gui.current_state = state
+    gui.status_label.config(text="🟢 подключён",
+                            fg=gui.pal.accent_success)
+    gui.update_interface(state)
+    gui.current_layer.set(4)
+    gui.update_map()
+    # Выбираем корабль A2 для демонстрации Арбитража.
+    gui.root.after(100, lambda: gui._select_ship("A2"))
+    gui.root.after(200, lambda: gui._push_history("A2  +1 HP"))
+    gui.root.after(220,
+                    lambda: gui._push_history("B3  ✖ KILL"))
+    gui.root.after(240, lambda: gui._push_history(
+        "A5 → (6,4,4)  HP:0  жив"))
+    gui.root.mainloop()
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "map"
     if cmd == "map":
@@ -267,6 +360,8 @@ if __name__ == "__main__":
         run_hud()
     elif cmd == "legend":
         run_legend()
+    elif cmd == "gm":
+        run_gm()
     else:
         print(f"unknown demo '{cmd}'", file=sys.stderr)
         sys.exit(2)

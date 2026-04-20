@@ -1,452 +1,561 @@
-# game_master_gui.py
+# game_master_gui.py — панель гейммастера (UI overhaul v2).
+#
+# Цели переработки:
+#   • Единая тема из ui_theme.py (палитра, шрифты, цвета команд, иконки).
+#   • Карта как Canvas-клетки с иконками типов кораблей и HP-бейджами —
+#     читается так же, как клиентская карта.
+#   • HUD-плашки команд вместо Treeview-статистики.
+#   • Журнал боя с иконками и цветными тегами — как у игрока.
+#   • Панель «Арбитраж» прямо в правой колонке: выбор корабля, быстрые
+#     кнопки HIT/HEAL/REVIVE/KILL/PHASE, ручная правка X/Y/Z, история
+#     последних override'ов.
+#   • Кнопка «?» — та же справка по типам, что и у игрока (импортируется).
+
 import socket
 import threading
 import time
-from tkinter import *
-from tkinter import ttk, messagebox, font
+from tkinter import (
+    BOTH, BOTTOM, CENTER, DISABLED, E, END, EW, FLAT, HORIZONTAL, LEFT, N, NE,
+    NORMAL, NS, NSEW, NW, RIGHT, S, SUNKEN, TOP, VERTICAL, W, WORD, X, Y,
+    BooleanVar, Button, Canvas, Checkbutton, Entry, Frame, IntVar, Label,
+    LabelFrame, Scale, Scrollbar, Spinbox, StringVar, Text, Tk, Toplevel,
+    messagebox,
+)
+from tkinter import ttk, font
+
 from shared_simple import *
 from protocol import Framed, ProtocolError
+from ui_theme import (
+    Fonts,
+    Palette,
+    SHIP_TYPE_INFO,
+    TEAM_COLORS,
+    apply_theme,
+    hp_color,
+    ship_accent,
+    ship_icon,
+    ship_role,
+    ship_short,
+)
+
+
+# --------------------------------------------------------------------------- #
+# Tooltip
+# --------------------------------------------------------------------------- #
+
+class _Tooltip:
+    """Подсказка, появляющаяся над виджетом при hover."""
+
+    def __init__(self, widget, text_fn, delay=400):
+        self.widget = widget
+        self.text_fn = text_fn if callable(text_fn) else (lambda: text_fn)
+        self.delay = delay
+        self._after = None
+        self._tip = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<Button>", self._hide, add="+")
+
+    def _schedule(self, _e=None):
+        self._cancel()
+        self._after = self.widget.after(self.delay, self._show)
+
+    def _cancel(self):
+        if self._after:
+            self.widget.after_cancel(self._after)
+            self._after = None
+
+    def _show(self):
+        text = self.text_fn()
+        if not text:
+            return
+        pal = Palette()
+        fnt = Fonts()
+        self._tip = Toplevel(self.widget)
+        self._tip.wm_overrideredirect(True)
+        x = self.widget.winfo_rootx() + 16
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self._tip.geometry(f"+{x}+{y}")
+        Label(self._tip, text=text, bg=pal.bg_card, fg=pal.fg_primary,
+              font=fnt.small, justify=LEFT, bd=1, relief=SUNKEN,
+              padx=8, pady=4).pack()
+
+    def _hide(self, _e=None):
+        self._cancel()
+        if self._tip is not None:
+            self._tip.destroy()
+            self._tip = None
+
+
+# --------------------------------------------------------------------------- #
+# GUI
+# --------------------------------------------------------------------------- #
 
 class GameMasterGUI:
+    """Панель гейммастера.
+
+    Публичный поведенческий контракт (не менять — сервер ждёт):
+      * message {'type': 'game_master', 'player_name': ...}
+      * gm_command {'type':'gm_command', 'command': 'start_turn'|'end_planning'|
+                    'stop'|'override_ship', ...}
+    """
+
+    CELL_SIZE = 42
+    GRID = 10
+
     def __init__(self):
+        self.pal = Palette()
+        self.fnt = Fonts()
+
         self.socket = None
+        self.framed = None
         self.connected = False
         self.current_state = None
-        
-        # Цветовая схема
+        self.override_history = []   # list[str]
+
+        # Цвета сохранены для обратной совместимости с тестами (они
+        # обращаются к self.colors напрямую, см. tests/test_gm_and_history).
         self.colors = {
-            'bg': '#0a0e27',
-            'bg2': '#1a1f3a',
-            'fg': '#ffffff',
-            'accent1': '#00d4ff',
-            'accent2': '#ff6b6b',
-            'accent3': '#6bff6b',
-            'accent4': '#ffd700',
-            'panel': '#151a33',
-            'text': '#e0e0ff'
+            'bg': self.pal.bg_root,
+            'bg2': self.pal.bg_panel,
+            'fg': self.pal.fg_primary,
+            'accent1': self.pal.accent_info,
+            'accent2': self.pal.accent_danger,
+            'accent3': self.pal.accent_success,
+            'accent4': self.pal.accent_warning,
+            'panel': self.pal.bg_panel,
+            'text': self.pal.fg_primary,
         }
-        
-        # Создаем главное окно
+
         self.root = Tk()
-        self.root.title("🎮 ГЕЙММАСТЕР - КОСМИЧЕСКИЙ БОЙ")
-        self.root.geometry("1300x900")
-        self.root.configure(bg=self.colors['bg'])
-        
-        # Переменные
+        self.root.title("🎮 ГЕЙММАСТЕР — КОСМИЧЕСКИЙ БОЙ")
+        self.root.geometry("1360x900")
+        apply_theme(self.root, self.pal, self.fnt)
+        self.root.configure(bg=self.pal.bg_root)
+
         self.current_layer = IntVar(value=0)
-        self.cells = [[None for _ in range(10)] for _ in range(10)]
-        
-        # Создаем интерфейс
-        self.create_widgets()
-        
-        # Запускаем окно подключения
+        self.selected_ship_id = StringVar(value="")
+
+        # (row, col) -> (Canvas, dict_cell_state)
+        self.map_cells = {}
+        # ship_id -> Frame (карточка в списке кораблей)
+        self.ship_cards = {}
+
+        self._build()
+        self.root.after(500, self.tick_timer)
         self.show_connection_window()
-    
-    def create_widgets(self):
-        """Создает основные виджеты интерфейса"""
-        # Верхняя панель с заголовком
-        header_frame = Frame(self.root, bg='#000000', height=80)
-        header_frame.pack(fill=X)
-        header_frame.pack_propagate(False)
-        
-        # Заголовок
-        title_label = Label(header_frame,
-                           text="🎮 ГЕЙММАСТЕР - КОСМИЧЕСКИЙ БОЙ 10x10x10",
-                           bg='#000000', fg=self.colors['accent4'],
-                           font=('Arial', 20, 'bold'))
-        title_label.pack(expand=True)
-        
-        subtitle_label = Label(header_frame,
-                              text="ПОЛНАЯ ВИДИМОСТЬ • УПРАВЛЕНИЕ ИГРОЙ",
-                              bg='#000000', fg='white',
-                              font=('Arial', 12))
-        subtitle_label.pack()
-        
-        # Статусная строка
-        status_bar = Frame(self.root, bg=self.colors['panel'], height=30)
-        status_bar.pack(fill=X, padx=10, pady=5)
-        status_bar.pack_propagate(False)
-        
-        self.status_label = Label(status_bar, text="⚫ Не подключен",
-                                  bg=self.colors['panel'], fg='red',
-                                  font=('Arial', 10, 'bold'))
-        self.status_label.pack(side=LEFT, padx=10)
-        
-        # Основной контейнер
-        main_container = Frame(self.root, bg=self.colors['bg'])
-        main_container.pack(fill=BOTH, expand=True, padx=10, pady=5)
-        
-        # Левая панель - карта
-        left_panel = Frame(main_container, bg=self.colors['bg'])
-        left_panel.pack(side=LEFT, fill=BOTH, expand=True)
-        
-        # Правая панель - информация
-        right_panel = Frame(main_container, bg=self.colors['bg'], width=400)
-        right_panel.pack(side=RIGHT, fill=Y, padx=(10, 0))
-        right_panel.pack_propagate(False)
-        
-        # Создаем панели
-        self.create_map_panel(left_panel)
-        self.create_info_panel(right_panel)
-        self.create_control_panel(right_panel)
-        self.create_hits_panel(right_panel)
-        self.create_stats_panel(right_panel)
-        self.create_legend_panel(right_panel)
-    
-    def create_map_panel(self, parent):
-        """Панель с картой"""
-        map_frame = LabelFrame(parent, text="🗺️ КАРТА ПОЛЯ",
-                               bg=self.colors['panel'], fg=self.colors['accent1'],
-                               font=('Arial', 12, 'bold'))
-        map_frame.pack(fill=BOTH, expand=True)
-        
-        # Управление слоями
-        control_frame = Frame(map_frame, bg=self.colors['panel'])
-        control_frame.pack(fill=X, padx=10, pady=10)
-        
-        Label(control_frame, text="🔽 Слой Z:",
-              bg=self.colors['panel'], fg='white',
-              font=('Arial', 11)).pack(side=LEFT)
-        
-        # Слайдер с отслеживанием изменений
-        layer_scale = Scale(control_frame, from_=0, to=9, variable=self.current_layer,
-                           orient=HORIZONTAL, length=300,
-                           bg=self.colors['panel'], fg=self.colors['accent1'],
-                           troughcolor=self.colors['bg2'],
-                           activebackground=self.colors['accent1'],
-                           highlightbackground=self.colors['panel'],
-                           command=self.on_layer_change)  # Добавляем команду
-        layer_scale.pack(side=LEFT, padx=10)
-        
-        self.layer_label = Label(control_frame, text="Z = 0",
-                                bg=self.colors['panel'], fg=self.colors['accent1'],
-                                font=('Arial', 14, 'bold'))
+
+    # --------------------------------------------------------------- build ---
+
+    def _build(self):
+        pal, fnt = self.pal, self.fnt
+
+        # Header ---------------------------------------------------------------
+        header = Frame(self.root, bg=pal.bg_panel, height=64)
+        header.pack(fill=X)
+        header.pack_propagate(False)
+        Label(header, text="🎮  ГЕЙММАСТЕР",
+              bg=pal.bg_panel, fg=pal.accent_warning, font=fnt.h1
+              ).pack(side=LEFT, padx=18)
+        Label(header, text="полная видимость · арбитраж · лог",
+              bg=pal.bg_panel, fg=pal.fg_secondary, font=fnt.body
+              ).pack(side=LEFT, padx=(0, 20))
+        help_btn = Button(header, text="?", width=3,
+                          bg=pal.bg_card, fg=pal.accent_info,
+                          activebackground=pal.border_strong,
+                          activeforeground=pal.fg_title,
+                          font=fnt.h3, bd=0, relief=FLAT, cursor="hand2",
+                          command=self.open_legend)
+        help_btn.pack(side=RIGHT, padx=14)
+        _Tooltip(help_btn, "Справка по типам кораблей")
+
+        self.status_label = Label(header, text="⚫ не подключён",
+                                  bg=pal.bg_panel, fg=pal.accent_danger,
+                                  font=fnt.body_bold)
+        self.status_label.pack(side=RIGHT, padx=14)
+
+        # Three-column body ---------------------------------------------------
+        body = Frame(self.root, bg=pal.bg_root)
+        body.pack(fill=BOTH, expand=True, padx=10, pady=(8, 10))
+
+        self._build_map_column(body)
+        self._build_center_column(body)
+        self._build_right_column(body)
+
+    # ------------------------------------------------------------------ MAP --
+
+    def _build_map_column(self, parent):
+        pal, fnt = self.pal, self.fnt
+
+        col = Frame(parent, bg=pal.bg_root)
+        col.pack(side=LEFT, fill=BOTH, expand=True)
+
+        # Z-slider control.
+        ctrl = Frame(col, bg=pal.bg_panel)
+        ctrl.pack(fill=X, pady=(0, 6))
+        Label(ctrl, text="🗺  КАРТА · Z-слой",
+              bg=pal.bg_panel, fg=pal.accent_info, font=fnt.h3
+              ).pack(side=LEFT, padx=10, pady=6)
+        Scale(ctrl, from_=0, to=9, variable=self.current_layer,
+              orient=HORIZONTAL, length=260, showvalue=False,
+              bg=pal.bg_panel, fg=pal.accent_info,
+              troughcolor=pal.bg_root, activebackground=pal.accent_info,
+              highlightbackground=pal.bg_panel, bd=0,
+              command=lambda v: self._on_layer_change(v)
+              ).pack(side=LEFT, padx=6, pady=6)
+        self.layer_label = Label(ctrl, text="Z = 0",
+                                 bg=pal.bg_panel, fg=pal.accent_info,
+                                 font=fnt.h2, width=7, anchor=W)
         self.layer_label.pack(side=LEFT, padx=10)
-        
-        Button(control_frame, text="🔄 ОБНОВИТЬ",
-               bg=self.colors['accent1'], fg='black',
-               font=('Arial', 10, 'bold'),
-               command=self.update_map).pack(side=RIGHT)
-        
-        # Карта
-        map_container = Frame(map_frame, bg=self.colors['bg2'], bd=2, relief=SUNKEN)
-        map_container.pack(fill=BOTH, expand=True, padx=10, pady=10)
-        
-        map_grid = Frame(map_container, bg=self.colors['bg2'])
-        map_grid.pack(expand=True)
-        
-        # Создаем сетку 10x10
-        for row in range(10):
-            for col in range(10):
-                cell = Label(map_grid, text=" ", width=4, height=2,
-                           relief=RAISED, borderwidth=2,
-                           font=('Arial', 10, 'bold'),
-                           bg=self.colors['bg2'], fg='white')
-                cell.grid(row=row, column=col, padx=2, pady=2)
-                self.cells[row][col] = cell
-    
-    def on_layer_change(self, value):
-        """Обработчик изменения слоя"""
-        layer = int(float(value))
-        self.layer_label.config(text=f"Z = {layer}")
-        self.update_map()
-    
-    def create_info_panel(self, parent):
-        """Панель с информацией о ходе"""
-        info_frame = LabelFrame(parent, text="📊 ИНФОРМАЦИЯ О ХОДЕ",
-                                bg=self.colors['panel'], fg=self.colors['accent4'],
-                                font=('Arial', 12, 'bold'))
-        info_frame.pack(fill=X, pady=(0, 10))
-        
-        info_grid = Frame(info_frame, bg=self.colors['panel'])
-        info_grid.pack(fill=X, padx=10, pady=10)
-        
-        # Ход
-        Label(info_grid, text="Текущий ход:", bg=self.colors['panel'],
-              fg='white').grid(row=0, column=0, sticky=W, pady=5)
-        self.turn_label = Label(info_grid, text="0", bg=self.colors['panel'],
-                                fg=self.colors['accent4'], font=('Arial', 12, 'bold'))
-        self.turn_label.grid(row=0, column=1, sticky=W, padx=10, pady=5)
-        
-        # Фаза
-        Label(info_grid, text="Фаза игры:", bg=self.colors['panel'],
-              fg='white').grid(row=1, column=0, sticky=W, pady=5)
-        self.phase_label = Label(info_grid, text="ожидание", bg=self.colors['panel'],
-                                 fg='orange', font=('Arial', 12, 'bold'))
-        self.phase_label.grid(row=1, column=1, sticky=W, padx=10, pady=5)
-        
-        # Статус
-        Label(info_grid, text="Статус игры:", bg=self.colors['panel'],
-              fg='white').grid(row=2, column=0, sticky=W, pady=5)
-        self.game_status_label = Label(info_grid, text="Идет", bg=self.colors['panel'],
-                                       fg=self.colors['accent3'], font=('Arial', 12, 'bold'))
-        self.game_status_label.grid(row=2, column=1, sticky=W, padx=10, pady=5)
-    
-    def create_control_panel(self, parent):
-        """Панель управления ходом (start / end / stop / override)."""
-        frame = LabelFrame(parent, text="🎛️ УПРАВЛЕНИЕ ХОДОМ",
-                           bg=self.colors['panel'], fg=self.colors['accent1'],
-                           font=('Arial', 12, 'bold'))
-        frame.pack(fill=X, pady=(0, 10))
+        Button(ctrl, text="🔄 Обновить",
+               bg=pal.accent_info, fg="#06122a",
+               font=fnt.body_bold, bd=0, relief=FLAT, padx=12, pady=2,
+               activebackground="#3be6ff",
+               command=self.update_map).pack(side=RIGHT, padx=10, pady=6)
 
-        inner = Frame(frame, bg=self.colors['panel'])
-        inner.pack(fill=X, padx=10, pady=10)
+        # Map grid.
+        map_wrap = Frame(col, bg=pal.bg_map, bd=0)
+        map_wrap.pack(fill=BOTH, expand=True)
+        grid_w = self.CELL_SIZE * self.GRID
+        grid = Frame(map_wrap, bg=pal.bg_map)
+        grid.pack(padx=10, pady=10)
 
-        self.timer_label = Label(
-            inner,
-            text="⏱ ожидание…",
-            bg=self.colors['panel'],
-            fg=self.colors['accent4'],
-            font=('Arial', 11, 'bold'),
-        )
-        self.timer_label.grid(row=0, column=0, columnspan=3, sticky=W, pady=(0, 8))
+        # Column/row headers.
+        Label(grid, text="", bg=pal.bg_map).grid(row=0, column=0)
+        for c in range(self.GRID):
+            Label(grid, text=str(c), bg=pal.bg_map, fg=pal.fg_muted,
+                  font=fnt.small).grid(row=0, column=c + 1, sticky=NSEW)
+        for r in range(self.GRID):
+            Label(grid, text=str(r), bg=pal.bg_map, fg=pal.fg_muted,
+                  font=fnt.small).grid(row=r + 1, column=0, sticky=NSEW,
+                                        padx=(0, 3))
+            for c in range(self.GRID):
+                cv = Canvas(grid, width=self.CELL_SIZE, height=self.CELL_SIZE,
+                            bg=pal.bg_cell_empty,
+                            highlightthickness=1,
+                            highlightbackground=pal.border)
+                cv.grid(row=r + 1, column=c + 1, padx=1, pady=1)
+                cv.bind("<Button-1>",
+                        lambda e, rr=r, cc=c: self._on_cell_click(rr, cc))
+                self.map_cells[(r, c)] = {"canvas": cv, "ship_id": None,
+                                          "tooltip": None}
 
-        self.btn_start = Button(
-            inner, text="▶ Начать ход",
-            bg='#228B22', fg='white', font=('Arial', 10, 'bold'),
-            command=lambda: self.send_gm_command('start_turn'),
-            state=DISABLED,
-        )
-        self.btn_start.grid(row=1, column=0, sticky=EW, padx=2, pady=2)
+        # Footer: legend mini.
+        foot = Frame(col, bg=pal.bg_panel)
+        foot.pack(fill=X, pady=(6, 0))
+        for team in ("Team A", "Team B", "Team C"):
+            dot = Canvas(foot, width=14, height=14, bg=pal.bg_panel,
+                         highlightthickness=0)
+            dot.pack(side=LEFT, padx=(12, 4), pady=6)
+            dot.create_oval(1, 1, 13, 13, fill=TEAM_COLORS[team], outline="")
+            Label(foot, text=team, bg=pal.bg_panel, fg=pal.fg_secondary,
+                  font=fnt.small_bold).pack(side=LEFT, padx=(0, 8), pady=6)
+        Label(foot, text="клик по клетке → выбор корабля",
+              bg=pal.bg_panel, fg=pal.fg_muted, font=fnt.small
+              ).pack(side=RIGHT, padx=10, pady=6)
 
-        self.btn_end = Button(
-            inner, text="⏹ Завершить сбор",
-            bg='#b8860b', fg='white', font=('Arial', 10, 'bold'),
-            command=lambda: self.send_gm_command('end_planning'),
-            state=DISABLED,
-        )
-        self.btn_end.grid(row=1, column=1, sticky=EW, padx=2, pady=2)
+    # -------------------------------------------------------------- CENTER --
 
-        self.btn_stop = Button(
-            inner, text="🛑 Стоп",
-            bg='#8b0000', fg='white', font=('Arial', 10, 'bold'),
-            command=lambda: self.send_gm_command('stop'),
-            state=DISABLED,
-        )
-        self.btn_stop.grid(row=1, column=2, sticky=EW, padx=2, pady=2)
+    def _build_center_column(self, parent):
+        pal, fnt = self.pal, self.fnt
+        col = Frame(parent, bg=pal.bg_root, width=360)
+        col.pack(side=LEFT, fill=Y, padx=(10, 0))
+        col.pack_propagate(False)
 
-        self.btn_override = Button(
-            inner, text="🛠 Override позиции корабля",
-            bg=self.colors['accent1'], fg='black', font=('Arial', 10, 'bold'),
-            command=self.open_override_dialog,
-            state=DISABLED,
-        )
-        self.btn_override.grid(row=2, column=0, columnspan=3, sticky=EW, padx=2, pady=(6, 2))
+        # Turn / phase.
+        top = Frame(col, bg=pal.bg_panel)
+        top.pack(fill=X, pady=(0, 8))
+        head_row = Frame(top, bg=pal.bg_panel)
+        head_row.pack(fill=X, padx=12, pady=(10, 4))
+        self.turn_label = Label(head_row, text="ХОД 0 /30",
+                                bg=pal.bg_panel, fg=pal.fg_title,
+                                font=fnt.h2)
+        self.turn_label.pack(side=LEFT)
+        self.phase_label = Label(head_row, text="⏳ ожидание",
+                                 bg=pal.bg_panel, fg=pal.fg_secondary,
+                                 font=fnt.body_bold)
+        self.phase_label.pack(side=LEFT, padx=12)
+        self.timer_label = Label(top, text="⏱ ожидание…",
+                                 bg=pal.bg_panel, fg=pal.accent_warning,
+                                 font=fnt.body_bold)
+        self.timer_label.pack(anchor=W, padx=12, pady=(0, 10))
 
-        for col in range(3):
-            inner.grid_columnconfigure(col, weight=1, uniform='gm_btn')
+        # Turn controls.
+        ctl = Frame(col, bg=pal.bg_panel)
+        ctl.pack(fill=X, pady=(0, 8))
+        Label(ctl, text="🎛  УПРАВЛЕНИЕ ХОДОМ",
+              bg=pal.bg_panel, fg=pal.accent_info, font=fnt.h3
+              ).grid(row=0, column=0, columnspan=3, sticky=W, padx=10,
+                     pady=(8, 6))
+        self.btn_start = Button(ctl, text="▶ Начать ход",
+                                bg="#228B22", fg="white", font=fnt.body_bold,
+                                bd=0, relief=FLAT, padx=8, pady=6,
+                                state=DISABLED,
+                                command=lambda: self.send_gm_command(
+                                    'start_turn'))
+        self.btn_start.grid(row=1, column=0, sticky=EW, padx=8, pady=2)
+        self.btn_end = Button(ctl, text="⏹ Завершить сбор",
+                              bg="#b8860b", fg="white", font=fnt.body_bold,
+                              bd=0, relief=FLAT, padx=8, pady=6,
+                              state=DISABLED,
+                              command=lambda: self.send_gm_command(
+                                  'end_planning'))
+        self.btn_end.grid(row=1, column=1, sticky=EW, padx=4, pady=2)
+        self.btn_stop = Button(ctl, text="🛑 Стоп",
+                               bg="#8b0000", fg="white", font=fnt.body_bold,
+                               bd=0, relief=FLAT, padx=8, pady=6,
+                               state=DISABLED,
+                               command=lambda: self.send_gm_command('stop'))
+        self.btn_stop.grid(row=1, column=2, sticky=EW, padx=(4, 8), pady=(2, 10))
+        for c in range(3):
+            ctl.grid_columnconfigure(c, weight=1, uniform="gm_btn")
 
-    def create_hits_panel(self, parent):
-        """Панель с попаданиями"""
-        hits_frame = LabelFrame(parent, text="💥 ПОПАДАНИЯ В ПОСЛЕДНЕМ ХОДУ",
-                                bg=self.colors['panel'], fg=self.colors['accent2'],
-                                font=('Arial', 12, 'bold'))
-        hits_frame.pack(fill=BOTH, expand=True, pady=(0, 10))
-        
-        # Текстовое поле с прокруткой
-        text_frame = Frame(hits_frame, bg=self.colors['panel'])
-        text_frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
-        
-        self.hits_text = Text(text_frame, height=8,
-                              bg='#000000', fg='#ff6b6b',
-                              font=('Courier', 10),
-                              wrap=WORD)
-        scrollbar = Scrollbar(text_frame, command=self.hits_text.yview)
-        self.hits_text.configure(yscrollcommand=scrollbar.set)
-        
-        self.hits_text.pack(side=LEFT, fill=BOTH, expand=True)
-        scrollbar.pack(side=RIGHT, fill=Y)
-        
-        # Настройка цветов
-        self.hits_text.tag_config('hit', foreground='#ff6b6b')
-        self.hits_text.tag_config('info', foreground='#00d4ff')
-    
-    def create_stats_panel(self, parent):
-        """Панель со статистикой команд"""
-        stats_frame = LabelFrame(parent, text="📈 СТАТИСТИКА КОМАНД",
-                                 bg=self.colors['panel'], fg=self.colors['accent3'],
-                                 font=('Arial', 12, 'bold'))
-        stats_frame.pack(fill=BOTH, expand=True, pady=(0, 10))
-        
-        # Treeview для статистики
-        tree_frame = Frame(stats_frame, bg=self.colors['panel'])
-        tree_frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
-        
-        # Стиль для Treeview
-        style = ttk.Style()
-        style.theme_use('clam')
-        style.configure("Treeview",
-                       background=self.colors['bg2'],
-                       foreground='white',
-                       fieldbackground=self.colors['bg2'])
-        style.configure("Treeview.Heading",
-                       background=self.colors['accent1'],
-                       foreground='black',
-                       font=('Arial', 10, 'bold'))
-        
-        columns = ("team", "total", "alive", "destroyed", "hits")
-        self.stats_tree = ttk.Treeview(tree_frame, columns=columns,
-                                        show="headings", height=4)
-        
-        self.stats_tree.heading("team", text="Команда")
-        self.stats_tree.heading("total", text="Всего")
-        self.stats_tree.heading("alive", text="Живых")
-        self.stats_tree.heading("destroyed", text="Уничтожено")
-        self.stats_tree.heading("hits", text="Попаданий")
-        
-        self.stats_tree.column("team", width=80)
-        self.stats_tree.column("total", width=50)
-        self.stats_tree.column("alive", width=50)
-        self.stats_tree.column("destroyed", width=70)
-        self.stats_tree.column("hits", width=70)
-        
-        self.stats_tree.pack(fill=BOTH, expand=True)
-        
-        # Цветные теги для команд
-        self.stats_tree.tag_configure('team_a', foreground='#4169E1')
-        self.stats_tree.tag_configure('team_b', foreground='#DC143C')
-        self.stats_tree.tag_configure('team_c', foreground='#228B22')
-    
-    def create_legend_panel(self, parent):
-        """Панель с легендой"""
-        legend_frame = LabelFrame(parent, text="📖 ЛЕГЕНДА КАРТЫ",
-                                  bg=self.colors['panel'], fg=self.colors['accent1'],
-                                  font=('Arial', 12, 'bold'))
-        legend_frame.pack(fill=X)
-        
-        legend_grid = Frame(legend_frame, bg=self.colors['panel'])
-        legend_grid.pack(fill=X, padx=10, pady=10)
-        
-        # Команды
-        Label(legend_grid, text="🟦 Team A", bg=self.colors['panel'],
-              fg='#4169E1', font=('Arial', 10, 'bold')).grid(row=0, column=0, sticky=W, pady=2)
-        
-        Label(legend_grid, text="🟥 Team B", bg=self.colors['panel'],
-              fg='#DC143C', font=('Arial', 10, 'bold')).grid(row=0, column=1, sticky=W, padx=20, pady=2)
-        
-        Label(legend_grid, text="🟩 Team C", bg=self.colors['panel'],
-              fg='#228B22', font=('Arial', 10, 'bold')).grid(row=0, column=2, sticky=W, padx=20, pady=2)
-        
-        # Типы кораблей
-        Label(legend_grid, text="К - Крейсер", bg=self.colors['panel'],
-              fg='white').grid(row=1, column=0, sticky=W, pady=2)
-        
-        Label(legend_grid, text="А - Артиллерия", bg=self.colors['panel'],
-              fg='white').grid(row=1, column=1, sticky=W, padx=20, pady=2)
-        
-        Label(legend_grid, text="Р - Радиовышка", bg=self.colors['panel'],
-              fg='white').grid(row=1, column=2, sticky=W, padx=20, pady=2)
-        
-        Label(legend_grid, text="Б - Базовый", bg=self.colors['panel'],
-              fg='white').grid(row=2, column=0, sticky=W, pady=2)
-        
-        Label(legend_grid, text="💥 - Попадания", bg=self.colors['panel'],
-              fg='orange').grid(row=2, column=1, sticky=W, padx=20, pady=2)
-        
-        Label(legend_grid, text="💀 - Уничтожен", bg=self.colors['panel'],
-              fg='gray').grid(row=2, column=2, sticky=W, padx=20, pady=2)
-        
-        # Сообщения
-        self.message_label = Label(parent, text="",
-                                    bg=self.colors['panel'], fg=self.colors['accent1'],
-                                    font=('Arial', 10))
-        self.message_label.pack(fill=X, pady=5)
-    
+        # Team pills.
+        pills = Frame(col, bg=pal.bg_root)
+        pills.pack(fill=X, pady=(0, 8))
+        self.team_pill_widgets = {}
+        for team in ("Team A", "Team B", "Team C"):
+            pill = Frame(pills, bg=pal.bg_panel)
+            pill.pack(fill=X, pady=2)
+            stripe = Canvas(pill, width=6, height=1,
+                            bg=TEAM_COLORS[team],
+                            highlightthickness=0)
+            stripe.pack(side=LEFT, fill=Y)
+            body = Frame(pill, bg=pal.bg_panel)
+            body.pack(side=LEFT, fill=X, expand=True, padx=10, pady=6)
+            name = Label(body, text=team, bg=pal.bg_panel,
+                         fg=TEAM_COLORS[team], font=fnt.body_bold)
+            name.pack(anchor=W)
+            details = Label(body, text="—", bg=pal.bg_panel,
+                            fg=pal.fg_primary, font=fnt.small)
+            details.pack(anchor=W)
+            self.team_pill_widgets[team] = details
+
+        # Battle log.
+        log_frame = Frame(col, bg=pal.bg_panel)
+        log_frame.pack(fill=BOTH, expand=True)
+        Label(log_frame, text="📜  ЖУРНАЛ БОЯ",
+              bg=pal.bg_panel, fg=pal.accent_danger, font=fnt.h3
+              ).pack(anchor=W, padx=10, pady=(8, 4))
+        log_body = Frame(log_frame, bg=pal.bg_panel)
+        log_body.pack(fill=BOTH, expand=True, padx=8, pady=(0, 8))
+        self.log_text = Text(log_body, wrap=WORD, bg=pal.bg_root,
+                             fg=pal.fg_primary, font=fnt.log, bd=0,
+                             insertbackground=pal.fg_primary, height=12)
+        sb = Scrollbar(log_body, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=sb.set)
+        self.log_text.pack(side=LEFT, fill=BOTH, expand=True)
+        sb.pack(side=RIGHT, fill=Y)
+        self._configure_log_tags()
+
+    # --------------------------------------------------------------- RIGHT --
+
+    def _build_right_column(self, parent):
+        pal, fnt = self.pal, self.fnt
+        col = Frame(parent, bg=pal.bg_root, width=360)
+        col.pack(side=RIGHT, fill=Y, padx=(10, 0))
+        col.pack_propagate(False)
+
+        # Arbiter tools (override).
+        arb = Frame(col, bg=pal.bg_panel)
+        arb.pack(fill=X, pady=(0, 8))
+        Label(arb, text="🛠  АРБИТРАЖ",
+              bg=pal.bg_panel, fg=pal.accent_warning, font=fnt.h3
+              ).pack(anchor=W, padx=10, pady=(8, 4))
+        self.selected_ship_label = Label(
+            arb, text="выберите корабль: клик по клетке или в списке ниже",
+            bg=pal.bg_panel, fg=pal.fg_secondary, font=fnt.small,
+            wraplength=330, justify=LEFT)
+        self.selected_ship_label.pack(anchor=W, padx=10, pady=(0, 6))
+
+        xyz = Frame(arb, bg=pal.bg_panel)
+        xyz.pack(anchor=W, padx=10, pady=(0, 6))
+        self.x_var = IntVar(value=0)
+        self.y_var = IntVar(value=0)
+        self.z_var = IntVar(value=0)
+        self.hits_var = IntVar(value=0)
+        self.alive_var = BooleanVar(value=True)
+        for i, (lbl, var) in enumerate((("X", self.x_var),
+                                         ("Y", self.y_var),
+                                         ("Z", self.z_var))):
+            Label(xyz, text=lbl, bg=pal.bg_panel, fg=pal.fg_secondary,
+                  font=fnt.small_bold).grid(row=0, column=i * 2,
+                                             padx=(0 if i == 0 else 6, 2))
+            Spinbox(xyz, from_=0, to=9, textvariable=var, width=3,
+                    font=fnt.body).grid(row=0, column=i * 2 + 1)
+        Label(xyz, text="HP", bg=pal.bg_panel, fg=pal.fg_secondary,
+              font=fnt.small_bold).grid(row=0, column=6, padx=(10, 2))
+        Spinbox(xyz, from_=0, to=10, textvariable=self.hits_var, width=3,
+                font=fnt.body).grid(row=0, column=7)
+        Checkbutton(xyz, text="жив", variable=self.alive_var,
+                    bg=pal.bg_panel, fg=pal.fg_primary,
+                    selectcolor=pal.bg_root,
+                    activebackground=pal.bg_panel,
+                    font=fnt.small_bold
+                    ).grid(row=0, column=8, padx=(8, 0))
+
+        # Apply override row.
+        q1 = Frame(arb, bg=pal.bg_panel)
+        q1.pack(fill=X, padx=10, pady=(4, 2))
+        self.btn_apply = Button(
+            q1, text="✅ Применить override",
+            bg=pal.accent_success, fg="#0a2a12", font=fnt.body_bold,
+            bd=0, relief=FLAT, padx=10, pady=6,
+            state=DISABLED, command=self._apply_override)
+        self.btn_apply.pack(fill=X)
+
+        # Quick actions row.
+        q2 = Frame(arb, bg=pal.bg_panel)
+        q2.pack(fill=X, padx=10, pady=(2, 8))
+        self.btn_hit = Button(q2, text="−1 HP", bg="#8b0000", fg="white",
+                              font=fnt.small_bold, bd=0, relief=FLAT,
+                              pady=6, state=DISABLED,
+                              command=lambda: self._quick(hits_delta=+1))
+        self.btn_hit.pack(side=LEFT, fill=X, expand=True, padx=(0, 2))
+        self.btn_heal = Button(q2, text="+1 HP", bg="#228B22", fg="white",
+                               font=fnt.small_bold, bd=0, relief=FLAT,
+                               pady=6, state=DISABLED,
+                               command=lambda: self._quick(hits_delta=-1))
+        self.btn_heal.pack(side=LEFT, fill=X, expand=True, padx=2)
+        self.btn_kill = Button(q2, text="✖ KILL", bg="#400000", fg="white",
+                               font=fnt.small_bold, bd=0, relief=FLAT,
+                               pady=6, state=DISABLED,
+                               command=lambda: self._quick(kill=True))
+        self.btn_kill.pack(side=LEFT, fill=X, expand=True, padx=(2, 0))
+
+        # Ship list.
+        sl = Frame(col, bg=pal.bg_panel)
+        sl.pack(fill=BOTH, expand=True)
+        Label(sl, text="🛰  КОРАБЛИ",
+              bg=pal.bg_panel, fg=pal.accent_info, font=fnt.h3
+              ).pack(anchor=W, padx=10, pady=(8, 4))
+        canvas = Canvas(sl, bg=pal.bg_panel, highlightthickness=0)
+        sb = Scrollbar(sl, orient=VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side=LEFT, fill=BOTH, expand=True, padx=(6, 0),
+                    pady=(0, 8))
+        sb.pack(side=RIGHT, fill=Y, pady=(0, 8))
+        self.ship_list_inner = Frame(canvas, bg=pal.bg_panel)
+        inner_id = canvas.create_window((0, 0), window=self.ship_list_inner,
+                                         anchor="nw")
+        self.ship_list_inner.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind(
+            "<Configure>",
+            lambda e, c=canvas, i=inner_id: c.itemconfigure(i, width=e.width))
+        for ev in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            canvas.bind_all(
+                ev, lambda e, c=canvas: self._scroll(e, c), add="+")
+        self.ship_list_canvas = canvas
+
+        # Override history.
+        hist = Frame(col, bg=pal.bg_panel)
+        hist.pack(fill=X, pady=(8, 0))
+        Label(hist, text="📋  ИСТОРИЯ OVERRIDE",
+              bg=pal.bg_panel, fg=pal.fg_secondary, font=fnt.h3
+              ).pack(anchor=W, padx=10, pady=(8, 4))
+        self.history_text = Text(hist, height=6, bg=pal.bg_root,
+                                 fg=pal.fg_secondary, font=fnt.log, bd=0,
+                                 wrap=WORD)
+        self.history_text.pack(fill=X, padx=8, pady=(0, 8))
+        self.history_text.insert(END, "—\n")
+        self.history_text.configure(state=DISABLED)
+
+        # Message label at bottom.
+        self.message_label = Label(col, text="",
+                                    bg=pal.bg_root, fg=pal.accent_warning,
+                                    font=fnt.small, anchor=W)
+        self.message_label.pack(fill=X, pady=(6, 0))
+
+    # --------------------------------------------------------- log tags ----
+
+    def _configure_log_tags(self):
+        p = self.pal
+        T = self.log_text
+        T.tag_config("turn_hdr", foreground=p.accent_info,
+                     font=(Fonts().family_sans, 11, "bold"))
+        T.tag_config("turn_sum", foreground=p.fg_muted)
+        T.tag_config("team_A", foreground=TEAM_COLORS["Team A"],
+                     font=(Fonts().family_sans, 10, "bold"))
+        T.tag_config("team_B", foreground=TEAM_COLORS["Team B"],
+                     font=(Fonts().family_sans, 10, "bold"))
+        T.tag_config("team_C", foreground=TEAM_COLORS["Team C"],
+                     font=(Fonts().family_sans, 10, "bold"))
+        T.tag_config("dmg", foreground=p.accent_warning)
+        T.tag_config("killed", foreground=p.accent_danger,
+                     font=(Fonts().family_sans, 10, "bold"))
+        T.tag_config("ram", foreground=p.accent_phase,
+                     font=(Fonts().family_sans, 10, "bold"))
+        T.tag_config("mine", foreground=p.accent_mine)
+        T.tag_config("holo", foreground=p.accent_phase)
+        T.tag_config("arrow", foreground=p.fg_muted)
+        T.tag_config("muted", foreground=p.fg_muted)
+
+    # ----------------------------------------------------- connection ------
+
     def show_connection_window(self):
-        """Показывает окно подключения"""
-        conn_window = Toplevel(self.root)
-        conn_window.title("🎮 Подключение гейммастера")
-        conn_window.geometry("400x400")
-        conn_window.configure(bg=self.colors['bg'])
-        conn_window.transient(self.root)
-        conn_window.grab_set()
-        
-        # Заголовок
-        title_font = font.Font(family='Arial', size=16, weight='bold')
-        Label(conn_window, text="🎮 ПОДКЛЮЧЕНИЕ ГЕЙММАСТЕРА",
-              bg=self.colors['bg'], fg=self.colors['accent4'],
-              font=title_font).pack(pady=20)
-        
-        # Рамка с полями
-        input_frame = Frame(conn_window, bg=self.colors['panel'], bd=2, relief=RAISED)
-        input_frame.pack(padx=30, pady=10, fill=BOTH, expand=True)
-        
-        # IP сервера
-        Label(input_frame, text="🌐 IP сервера:",
-              bg=self.colors['panel'], fg='white',
-              font=('Arial', 11)).pack(anchor=W, padx=20, pady=(15,5))
-        
-        self.ip_entry = Entry(input_frame, width=30, font=('Arial', 11),
-                              bg=self.colors['bg2'], fg='white',
-                              insertbackground='white')
+        pal, fnt = self.pal, self.fnt
+        conn = Toplevel(self.root)
+        conn.title("🎮 Подключение гейммастера")
+        conn.geometry("420x320")
+        conn.configure(bg=pal.bg_root)
+        conn.transient(self.root)
+        conn.grab_set()
+        Label(conn, text="🎮  ГЕЙММАСТЕР",
+              bg=pal.bg_root, fg=pal.accent_warning,
+              font=fnt.h1).pack(pady=16)
+        frm = Frame(conn, bg=pal.bg_panel)
+        frm.pack(padx=24, pady=8, fill=BOTH, expand=True)
+        Label(frm, text="🌐 IP сервера:", bg=pal.bg_panel, fg=pal.fg_primary,
+              font=fnt.body).pack(anchor=W, padx=16, pady=(14, 4))
+        self.ip_entry = Entry(frm, bg=pal.bg_root, fg=pal.fg_primary,
+                              insertbackground=pal.fg_primary,
+                              font=fnt.body, bd=0, relief=FLAT)
         self.ip_entry.insert(0, "localhost")
-        self.ip_entry.pack(padx=20, pady=5, fill=X)
-        
-        # Имя
-        Label(input_frame, text="👤 Ваше имя:",
-              bg=self.colors['panel'], fg='white',
-              font=('Arial', 11)).pack(anchor=W, padx=20, pady=(15,5))
-        
-        self.name_entry = Entry(input_frame, width=30, font=('Arial', 11),
-                                bg=self.colors['bg2'], fg='white',
-                                insertbackground='white')
+        self.ip_entry.pack(padx=16, pady=(0, 10), fill=X, ipady=4)
+        Label(frm, text="👤 Ваше имя:", bg=pal.bg_panel, fg=pal.fg_primary,
+              font=fnt.body).pack(anchor=W, padx=16, pady=(6, 4))
+        self.name_entry = Entry(frm, bg=pal.bg_root, fg=pal.fg_primary,
+                                insertbackground=pal.fg_primary,
+                                font=fnt.body, bd=0, relief=FLAT)
         self.name_entry.insert(0, "Гейммастер")
-        self.name_entry.pack(padx=20, pady=5, fill=X)
-        
-        # Кнопки
-        button_frame = Frame(conn_window, bg=self.colors['bg'])
-        button_frame.pack(pady=20)
-        
-        Button(button_frame, text="🎮 ПОДКЛЮЧИТЬСЯ",
-               bg=self.colors['accent3'], fg='black',
-               font=('Arial', 12, 'bold'),
+        self.name_entry.pack(padx=16, pady=(0, 14), fill=X, ipady=4)
+        btns = Frame(conn, bg=pal.bg_root)
+        btns.pack(pady=10)
+        Button(btns, text="🎮 Подключиться",
+               bg=pal.accent_success, fg="#0a2a12", font=fnt.body_bold,
+               bd=0, relief=FLAT, padx=18, pady=6,
                command=self.connect).pack(side=LEFT, padx=10)
-        
-        Button(button_frame, text="❌ ВЫХОД",
-               bg='red', fg='white',
-               font=('Arial', 12, 'bold'),
+        Button(btns, text="❌ Выход",
+               bg=pal.accent_danger, fg="white", font=fnt.body_bold,
+               bd=0, relief=FLAT, padx=18, pady=6,
                command=self.root.quit).pack(side=LEFT, padx=10)
-    
+
     def connect(self):
-        """Подключается к серверу"""
-        server_ip = self.ip_entry.get().strip()
-        player_name = self.name_entry.get().strip()
-        
-        if not server_ip:
-            server_ip = "localhost"
-        if not player_name:
-            player_name = "Гейммастер"
-        
+        server_ip = self.ip_entry.get().strip() or "localhost"
+        player_name = self.name_entry.get().strip() or "Гейммастер"
         try:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.settimeout(10)
             self.socket.connect((server_ip, 5555))
             self.framed = Framed(self.socket)
-
-            # Отправляем информацию о гейммастере
-            game_master_info = {
-                'type': 'game_master',
-                'player_name': player_name,
-            }
-            self.framed.send(game_master_info)
-
+            self.framed.send({'type': 'game_master',
+                              'player_name': player_name})
             self.connected = True
-            self.status_label.config(text="✅ Подключен к серверу", fg=self.colors['accent3'])
-            
-            # Закрываем окно подключения
+            self.status_label.config(text="🟢 подключён",
+                                     fg=self.pal.accent_success)
             self.ip_entry.master.master.destroy()
-            
-            # Запускаем поток для получения данных
-            self.receive_thread = threading.Thread(target=self.receive_loop, daemon=True)
+            self.receive_thread = threading.Thread(target=self.receive_loop,
+                                                    daemon=True)
             self.receive_thread.start()
-            
-            messagebox.showinfo("Успех", "🎮 Успешно подключен как гейммастер!\nВы видите все корабли и попадания.")
-            
+            messagebox.showinfo("Успех",
+                                "🎮 Подключение установлено как гейммастер.")
         except Exception as e:
-            messagebox.showerror("Ошибка подключения", f"Не удалось подключиться: {e}")
-    
+            messagebox.showerror("Ошибка подключения",
+                                 f"Не удалось подключиться: {e}")
+
     def receive_loop(self):
-        """Цикл получения данных от сервера через framed-протокол."""
         while self.connected:
             try:
                 msg = self.framed.recv_once(timeout=1)
@@ -456,9 +565,7 @@ class GameMasterGUI:
                     self.root.after(
                         0,
                         lambda err=str(e): messagebox.showinfo(
-                            "Соединение", f"Сервер закрыл соединение: {err}"
-                        ),
-                    )
+                            "Соединение", f"Сервер закрыл соединение: {err}"))
                 break
             except Exception as e:
                 if self.connected:
@@ -466,73 +573,68 @@ class GameMasterGUI:
                     self.root.after(
                         0,
                         lambda t=err_text: self.message_label.config(
-                            text=t, fg='red'
-                        ),
-                    )
+                            text=t, fg=self.pal.accent_danger))
                     time.sleep(1)
                 continue
-
             if msg is None:
                 continue
-
             if isinstance(msg, dict) and msg.get('type') == 'reject':
                 reason = msg.get('reason', 'Сервер отклонил подключение')
                 self.connected = False
                 self.root.after(
                     0,
-                    lambda r=reason: messagebox.showerror("Отказ сервера", r),
-                )
+                    lambda r=reason: messagebox.showerror("Отказ сервера", r))
                 break
-
             self.current_state = msg
             self.root.after(0, self.update_interface, msg)
-    
+
+    # ---------------------------------------------------- interface upd ----
+
     def update_interface(self, state):
-        """Обновляет интерфейс на основе полученного состояния"""
         turn = state.get('turn', 0) + 1
+        limit = state.get('turn_limit', 30)
         phase = state.get('phase', 'unknown')
         message = state.get('message', '')
         game_over = state.get('game_over', False)
 
-        # Обновляем информацию
-        self.turn_label.config(text=str(turn))
-
+        self.turn_label.config(text=f"ХОД {turn} /{limit}")
         if phase == 'planning':
-            self.phase_label.config(text="📝 ПЛАНИРОВАНИЕ", fg=self.colors['accent3'])
+            self.phase_label.config(text="📝 планирование",
+                                    fg=self.pal.accent_success)
         elif phase == 'results':
-            self.phase_label.config(text="📊 РЕЗУЛЬТАТЫ", fg='orange')
+            self.phase_label.config(text="📊 результаты",
+                                    fg=self.pal.accent_warning)
         elif phase == 'waiting_for_gm':
-            self.phase_label.config(text="⏳ ЖДЁТ GM", fg=self.colors['accent4'])
+            self.phase_label.config(text="⏳ ждёт GM",
+                                    fg=self.pal.accent_info)
         else:
-            self.phase_label.config(text=phase.upper(), fg='gray')
+            self.phase_label.config(text=phase, fg=self.pal.fg_secondary)
 
         if game_over:
-            winner = state.get('winner', 'Не определен')
-            self.game_status_label.config(text=f"Окончена. Победитель: {winner}", fg='red')
-            self.message_label.config(text=f"🏆 ИГРА ОКОНЧЕНА! Победитель: {winner}", fg=self.colors['accent4'])
+            winner = state.get('winner', 'Не определён')
+            self.message_label.config(
+                text=f"🏆 ИГРА ОКОНЧЕНА! Победитель: {winner}",
+                fg=self.pal.accent_warning)
         else:
-            self.game_status_label.config(text="Идет", fg=self.colors['accent3'])
-            self.message_label.config(text=message, fg='white')
+            self.message_label.config(text=message,
+                                      fg=self.pal.fg_secondary)
 
-        # Статус кнопок управления: зависит от фазы.
+        # Turn-controls enable.
         can_start = (phase == 'waiting_for_gm') and not game_over
         can_end = (phase == 'planning') and not game_over
         can_stop = not game_over
-        can_override = not game_over
         self.btn_start.config(state=(NORMAL if can_start else DISABLED))
         self.btn_end.config(state=(NORMAL if can_end else DISABLED))
         self.btn_stop.config(state=(NORMAL if can_stop else DISABLED))
-        self.btn_override.config(state=(NORMAL if can_override else DISABLED))
 
-        # Таймер фазы планирования.
+        # Timer display.
         deadline = state.get('planning_deadline')
         if phase == 'planning' and deadline:
             remaining = max(0, int(deadline - time.time()))
             received = state.get('actions_received_teams', [])
             connected = state.get('connected_teams', [])
             self.timer_label.config(
-                text=f"⏱ {remaining}с  |  действия: {len(received)}/{len(connected)}"
-            )
+                text=f"⏱ {remaining}с  ·  сборы {len(received)}/{len(connected)}")
         elif phase == 'waiting_for_gm':
             self.timer_label.config(text="⏸ ждём старта — нажмите «Начать ход»")
         elif phase == 'results':
@@ -542,95 +644,525 @@ class GameMasterGUI:
         else:
             self.timer_label.config(text="⏱ ожидание…")
 
-        # Обновляем статистику команд
-        self.update_stats(state)
-
-        # Обновляем информацию о попаданиях
-        self.update_hits_info(state)
-
-        # Обновляем карту
+        self._update_team_pills(state)
+        self._rebuild_ship_list(state)
+        self._rebuild_battle_log(state)
         self.update_map()
-    
-    def update_stats(self, state):
-        """Обновляет статистику команд"""
-        # Очищаем список
-        for item in self.stats_tree.get_children():
-            self.stats_tree.delete(item)
-        
-        all_ships = state.get('all_ships', {})
-        
-        # Собираем статистику по командам
-        team_stats = {
-            'Team A': {'total': 0, 'alive': 0, 'destroyed': 0, 'hits': 0},
-            'Team B': {'total': 0, 'alive': 0, 'destroyed': 0, 'hits': 0},
-            'Team C': {'total': 0, 'alive': 0, 'destroyed': 0, 'hits': 0}
-        }
-        
-        for ship_id, ship in all_ships.items():
-            team = ship['team']
-            if team in team_stats:
-                team_stats[team]['total'] += 1
-                if ship['alive']:
-                    team_stats[team]['alive'] += 1
-                    team_stats[team]['hits'] += ship['hits']
-                else:
-                    team_stats[team]['destroyed'] += 1
-        
-        # Добавляем в Treeview с цветными тегами
-        self.stats_tree.insert("", "end", values=(
-            'Team A',
-            team_stats['Team A']['total'],
-            team_stats['Team A']['alive'],
-            team_stats['Team A']['destroyed'],
-            team_stats['Team A']['hits']
-        ), tags=('team_a',))
-        
-        self.stats_tree.insert("", "end", values=(
-            'Team B',
-            team_stats['Team B']['total'],
-            team_stats['Team B']['alive'],
-            team_stats['Team B']['destroyed'],
-            team_stats['Team B']['hits']
-        ), tags=('team_b',))
-        
-        self.stats_tree.insert("", "end", values=(
-            'Team C',
-            team_stats['Team C']['total'],
-            team_stats['Team C']['alive'],
-            team_stats['Team C']['destroyed'],
-            team_stats['Team C']['hits']
-        ), tags=('team_c',))
-    
-    def update_hits_info(self, state):
-        """Перерисовывает журнал всех попаданий партии (scrollable)."""
-        self.hits_text.delete(1.0, END)
 
+    # -------------------------------------------------------- team pills ---
+
+    def _update_team_pills(self, state):
+        all_ships = state.get('all_ships', {})
+        stats = {t: {'alive': 0, 'total': 0, 'dmg': 0, 'kills': 0}
+                 for t in TEAM_COLORS}
+        for ship in all_ships.values():
+            t = ship.get('team')
+            if t not in stats:
+                continue
+            stats[t]['total'] += 1
+            if ship.get('alive'):
+                stats[t]['alive'] += 1
+        for h in state.get('hit_history', []):
+            atk = h.get('attacker')
+            if atk in stats:
+                stats[atk]['dmg'] += 1
+                if h.get('killed'):
+                    stats[atk]['kills'] += 1
+        for team, w in self.team_pill_widgets.items():
+            s = stats[team]
+            w.config(text=f"{s['alive']}/{s['total']} живых · "
+                          f"⚡{s['dmg']} урона · ✖{s['kills']} киллов")
+
+    # ------------------------------------------------------- ship list ----
+
+    def _rebuild_ship_list(self, state):
+        pal, fnt = self.pal, self.fnt
+        for w in self.ship_list_inner.winfo_children():
+            w.destroy()
+        self.ship_cards.clear()
+        all_ships = state.get('all_ships', {})
+        # Сортируем: Team A, B, C, по id.
+        for sid, s in sorted(all_ships.items(),
+                              key=lambda x: (x[1].get('team', ''), x[0])):
+            self._render_ship_card(sid, s)
+
+    def _render_ship_card(self, sid, s):
+        pal, fnt = self.pal, self.fnt
+        team = s.get('team', 'Team A')
+        team_c = TEAM_COLORS.get(team, pal.accent_info)
+        tname = s.get('type', '?')
+        alive = bool(s.get('alive', True))
+        hp_max = max(1, int(s.get('max_hits', 1)))
+        hp = max(0, hp_max - int(s.get('hits', 0))) if alive else 0
+
+        card = Frame(self.ship_list_inner, bg=pal.bg_card, bd=0,
+                     highlightthickness=1,
+                     highlightbackground=pal.border)
+        card.pack(fill=X, padx=6, pady=2)
+        card.bind("<Button-1>", lambda e, i=sid: self._select_ship(i))
+        stripe = Canvas(card, width=4, height=1, bg=team_c,
+                        highlightthickness=0)
+        stripe.pack(side=LEFT, fill=Y)
+        body = Frame(card, bg=pal.bg_card)
+        body.pack(side=LEFT, fill=X, expand=True, padx=6, pady=4)
+        body.bind("<Button-1>", lambda e, i=sid: self._select_ship(i))
+
+        top = Frame(body, bg=pal.bg_card)
+        top.pack(fill=X)
+        top.bind("<Button-1>", lambda e, i=sid: self._select_ship(i))
+        Label(top, text=ship_icon(tname), bg=pal.bg_card,
+              fg=ship_accent(tname), font=fnt.body_bold
+              ).pack(side=LEFT, padx=(0, 4))
+        Label(top, text=f"{sid}", bg=pal.bg_card, fg=team_c,
+              font=fnt.small_bold).pack(side=LEFT)
+        Label(top, text=f"· {tname}", bg=pal.bg_card,
+              fg=pal.fg_primary, font=fnt.small).pack(side=LEFT, padx=4)
+        pos = Label(top,
+                    text=f"({s.get('x','?')},{s.get('y','?')},{s.get('z','?')})",
+                    bg=pal.bg_card, fg=pal.fg_secondary, font=fnt.small)
+        pos.pack(side=RIGHT)
+
+        hp_row = Frame(body, bg=pal.bg_card)
+        hp_row.pack(fill=X, pady=(2, 0))
+        hp_row.bind("<Button-1>", lambda e, i=sid: self._select_ship(i))
+        if alive:
+            col = hp_color(hp, hp_max, pal)
+            bar = Canvas(hp_row, height=6, bg=pal.bg_panel,
+                         highlightthickness=0)
+            bar.pack(fill=X, side=LEFT, expand=True)
+            bar.bind("<Button-1>", lambda e, i=sid: self._select_ship(i))
+            bar.bind("<Configure>",
+                     lambda e, c=bar, h=hp, m=hp_max, col=col:
+                     self._draw_hp_bar(c, h, m, col))
+            Label(hp_row, text=f"{hp}/{hp_max}", bg=pal.bg_card,
+                  fg=col, font=fnt.small_bold).pack(side=RIGHT, padx=6)
+        else:
+            Label(hp_row, text="💀  УНИЧТОЖЕН", bg=pal.bg_card,
+                  fg=pal.accent_danger, font=fnt.small_bold
+                  ).pack(side=LEFT, padx=4)
+        self.ship_cards[sid] = card
+
+        # Highlight if selected.
+        if self.selected_ship_id.get() == sid:
+            card.configure(highlightbackground=pal.accent_info,
+                           highlightthickness=2)
+
+    @staticmethod
+    def _draw_hp_bar(canvas, hp, hp_max, color):
+        canvas.delete("all")
+        w = max(1, canvas.winfo_width())
+        h = canvas.winfo_height()
+        canvas.create_rectangle(0, 0, w, h,
+                                 fill=Palette().bg_panel, outline="")
+        filled = int(w * (hp / hp_max)) if hp_max else 0
+        canvas.create_rectangle(0, 0, filled, h, fill=color, outline="")
+
+    @staticmethod
+    def _scroll(event, canvas):
+        # Only respond if pointer is over this canvas.
+        x, y = event.x_root, event.y_root
+        try:
+            over = canvas.winfo_containing(x, y)
+        except Exception:
+            over = None
+        w = over
+        while w is not None:
+            if w is canvas:
+                break
+            w = getattr(w, "master", None)
+        if w is not canvas:
+            return
+        if getattr(event, "num", None) == 4:
+            canvas.yview_scroll(-1, "units")
+        elif getattr(event, "num", None) == 5:
+            canvas.yview_scroll(1, "units")
+        else:
+            delta = -1 if event.delta > 0 else 1
+            canvas.yview_scroll(delta, "units")
+
+    # ---------------------------------------------------- battle log ------
+
+    def _rebuild_battle_log(self, state):
+        T = self.log_text
+        T.configure(state=NORMAL)
+        T.delete("1.0", END)
         history = state.get('hit_history', [])
         if not history:
-            self.hits_text.insert(END, "Попаданий ещё не было\n", 'info')
+            T.insert(END, "Событий ещё нет.\n", "muted")
+            T.configure(state=DISABLED)
             return
+        # Group by turn; compute per-turn summary.
+        from collections import defaultdict
+        by_turn = defaultdict(list)
+        for h in history:
+            by_turn[int(h.get('turn', 0))].append(h)
+        for turn in sorted(by_turn):
+            events = by_turn[turn]
+            dmg_by = defaultdict(int)
+            kills_by = defaultdict(int)
+            for h in events:
+                atk = h.get('attacker', '?')
+                dmg_by[atk] += 1
+                if h.get('killed'):
+                    kills_by[atk] += 1
+            parts = []
+            for t in ("Team A", "Team B", "Team C"):
+                if dmg_by[t] or kills_by[t]:
+                    bit = f"{t[-1]}:{dmg_by[t]}dmg"
+                    if kills_by[t]:
+                        bit += f"/{kills_by[t]}✖"
+                    parts.append(bit)
+            T.insert(END, f"── Ход {turn} ", "turn_hdr")
+            if parts:
+                T.insert(END, "(" + " · ".join(parts) + ")\n", "turn_sum")
+            else:
+                T.insert(END, "\n", "turn_sum")
+            for h in events:
+                self._append_log_line(h)
+        T.configure(state=DISABLED)
+        T.see(END)
 
-        self.hits_text.insert(END, f"💥 ЖУРНАЛ ПОПАДАНИЙ ({len(history)}):\n\n", 'info')
-        for hit in history:
-            turn = hit.get('turn', '?')
-            attacker = hit.get('attacker', '?')
-            attacker_name = hit.get('attacker_name', '?')
-            target = hit.get('target', '?')
-            target_name = hit.get('target_name', '?')
-            position = hit.get('position', '?')
-            killed = hit.get('killed', False)
-            marker = "💀" if killed else "🎯"
-            self.hits_text.insert(
-                END,
-                f"T{turn:>2}: {marker} {attacker} {attacker_name} → "
-                f"{target} {target_name} @ {position}\n",
-                'hit',
-            )
-        self.hits_text.see(END)
+    def _append_log_line(self, h):
+        T = self.log_text
+        kind = h.get('kind', 'hit')
+        atk = h.get('attacker', '?')
+        tgt = h.get('target', '?')
+        atk_tag = f"team_{atk[-1]}" if atk in TEAM_COLORS else "muted"
+        tgt_tag = f"team_{tgt[-1]}" if tgt in TEAM_COLORS else "muted"
+        pos = h.get('position', '?')
+        dmg = h.get('damage', 1)
+        killed = bool(h.get('killed'))
+        atk_name = h.get('attacker_name', '')
+        tgt_name = h.get('target_name', '')
 
-    # ─────────────────────────── GM commands ──────────────────────────
+        T.insert(END, "   ", "muted")
+        if kind == "ram":
+            T.insert(END, "💥 ", "ram")
+            T.insert(END, f"{atk} {atk_name} ", atk_tag)
+            T.insert(END, "⚡таран ", "ram")
+            T.insert(END, f"→ {tgt} {tgt_name}", tgt_tag)
+            T.insert(END, f"  @ {pos}", "muted")
+        elif kind == "mine":
+            T.insert(END, "💀 ", "mine")
+            T.insert(END, f"Мина({atk}) ", "mine")
+            T.insert(END, f"→ {tgt} {tgt_name}", tgt_tag)
+            T.insert(END, f"  @ {pos}", "muted")
+        elif kind == "holo":
+            T.insert(END, "🎭 ", "holo")
+            T.insert(END, f"{tgt} {tgt_name} ", tgt_tag)
+            T.insert(END, "раскрыл голограмму ", "holo")
+            T.insert(END, f"{atk}", atk_tag)
+            T.insert(END, f"  @ {pos}", "muted")
+        else:
+            T.insert(END, "🎯 ", atk_tag)
+            T.insert(END, f"{atk} {atk_name} ", atk_tag)
+            T.insert(END, "→ ", "arrow")
+            T.insert(END, f"{tgt} {tgt_name}", tgt_tag)
+            T.insert(END, f"  @ {pos}", "muted")
+        if dmg:
+            T.insert(END, f"  -{dmg}HP", "dmg")
+        if killed:
+            T.insert(END, "  ✖УБИТ", "killed")
+        T.insert(END, "\n")
+
+    # ------------------------------------------------------- map draw -----
+
+    def update_map(self, *_):
+        if not self.current_state:
+            self._clear_map_cells()
+            return
+        layer = self.current_layer.get()
+        self.layer_label.config(text=f"Z = {layer}")
+        all_ships = self.current_state.get('all_ships', {})
+
+        # Clear cells.
+        self._clear_map_cells()
+
+        # Build {(x,y): best_ship} on current layer (prefer alive over dead).
+        by_cell = {}
+        for sid, s in all_ships.items():
+            if s.get('z') != layer:
+                continue
+            key = (s.get('x'), s.get('y'))
+            cur = by_cell.get(key)
+            if cur is None:
+                by_cell[key] = (sid, s)
+            else:
+                # prefer alive
+                if s.get('alive') and not cur[1].get('alive'):
+                    by_cell[key] = (sid, s)
+
+        for (x, y), (sid, s) in by_cell.items():
+            if not (0 <= y < self.GRID and 0 <= x < self.GRID):
+                continue
+            self._draw_ship_cell(y, x, sid, s)
+
+    def _clear_map_cells(self):
+        pal = self.pal
+        for (r, c), info in self.map_cells.items():
+            cv = info["canvas"]
+            cv.delete("all")
+            cv.configure(bg=pal.bg_cell_empty,
+                         highlightbackground=pal.border)
+            info["ship_id"] = None
+
+    def _draw_ship_cell(self, r, c, sid, s):
+        pal, fnt = self.pal, self.fnt
+        info = self.map_cells[(r, c)]
+        cv = info["canvas"]
+        cv.delete("all")
+        team = s.get('team', 'Team A')
+        team_c = TEAM_COLORS.get(team, pal.accent_info)
+        alive = bool(s.get('alive', True))
+        tname = s.get('type', '?')
+        hp_max = max(1, int(s.get('max_hits', 1)))
+        hp = max(0, hp_max - int(s.get('hits', 0)))
+
+        # Background.
+        if not alive:
+            cv.configure(bg=pal.bg_cell_empty,
+                         highlightbackground=pal.accent_danger)
+        else:
+            cv.configure(bg=pal.bg_card, highlightbackground=team_c)
+
+        W = self.CELL_SIZE
+        # Team corner-stripe.
+        cv.create_rectangle(0, 0, W, 4, fill=team_c, outline="")
+        # Icon.
+        cv.create_text(W / 2, W / 2 - 4,
+                       text=ship_icon(tname) if alive else "💀",
+                       fill=ship_accent(tname) if alive else pal.accent_danger,
+                       font=fnt.cell_icon)
+        # Ship id small badge bottom-left.
+        cv.create_text(4, W - 4, anchor="sw", text=sid,
+                       fill=pal.fg_secondary, font=fnt.small_bold)
+        # HP bar.
+        if alive:
+            bar_w = int((W - 6) * (hp / hp_max)) if hp_max else 0
+            cv.create_rectangle(3, W - 7, W - 3, W - 4,
+                                fill=pal.bg_panel, outline="")
+            col = hp_color(hp, hp_max, pal)
+            cv.create_rectangle(3, W - 7, 3 + bar_w, W - 4,
+                                fill=col, outline="")
+        # Phase ring.
+        if alive and s.get('is_phased'):
+            cv.create_oval(4, 4, W - 4, W - 4,
+                           outline=pal.accent_phase, width=2, dash=(3, 2))
+        info["ship_id"] = sid
+
+        # Tooltip text.
+        ttext = (f"{sid} · {team} · {tname}\n"
+                 f"({s.get('x')},{s.get('y')},{s.get('z')})  "
+                 f"HP {hp}/{hp_max}" + ("  ФАЗА" if s.get('is_phased') else ""))
+        if not alive:
+            ttext += "\n💀 уничтожен"
+        existing = info.get("tooltip")
+        if existing is not None:
+            existing.text_fn = lambda t=ttext: t
+        else:
+            info["tooltip"] = _Tooltip(cv, (lambda t=ttext: t))
+
+    def _on_cell_click(self, r, c):
+        info = self.map_cells.get((r, c), {})
+        sid = info.get("ship_id")
+        if sid:
+            self._select_ship(sid)
+
+    def _on_layer_change(self, value):
+        try:
+            layer = int(float(value))
+        except Exception:
+            layer = 0
+        self.layer_label.config(text=f"Z = {layer}")
+        self.update_map()
+
+    # ------------------------------------------------------ selection -----
+
+    def _select_ship(self, sid):
+        self.selected_ship_id.set(sid)
+        state = self.current_state or {}
+        s = state.get('all_ships', {}).get(sid)
+        if not s:
+            return
+        self.selected_ship_label.config(
+            text=f"выбран: {sid}  [{s.get('team','?')}]  {s.get('type','?')}  "
+                 f"({s.get('x','?')},{s.get('y','?')},{s.get('z','?')})  "
+                 f"hits={s.get('hits',0)}  "
+                 f"{'alive' if s.get('alive') else 'DEAD'}",
+            fg=self.pal.fg_primary)
+        try:
+            self.x_var.set(int(s.get('x', 0)))
+            self.y_var.set(int(s.get('y', 0)))
+            self.z_var.set(int(s.get('z', 0)))
+            self.hits_var.set(int(s.get('hits', 0)))
+            self.alive_var.set(bool(s.get('alive', True)))
+        except Exception:
+            pass
+        for b in (self.btn_apply, self.btn_hit, self.btn_heal, self.btn_kill):
+            b.config(state=NORMAL)
+        # Highlight card.
+        for other_sid, card in self.ship_cards.items():
+            if other_sid == sid:
+                card.configure(highlightbackground=self.pal.accent_info,
+                               highlightthickness=2)
+            else:
+                card.configure(highlightbackground=self.pal.border,
+                               highlightthickness=1)
+
+    # ------------------------------------------------------- override -----
+
+    def _apply_override(self):
+        sid = self.selected_ship_id.get()
+        if not sid:
+            return
+        ok = self.send_gm_command(
+            'override_ship', ship_id=sid,
+            x=int(self.x_var.get()), y=int(self.y_var.get()),
+            z=int(self.z_var.get()), alive=bool(self.alive_var.get()),
+            hits=int(self.hits_var.get()))
+        if ok:
+            state = "жив" if self.alive_var.get() else "МЁРТВ"
+            self._push_history(
+                f"{sid} → ({self.x_var.get()},{self.y_var.get()},"
+                f"{self.z_var.get()})  HP:{self.hits_var.get()}  {state}")
+
+    def _quick(self, hits_delta=0, kill=False):
+        sid = self.selected_ship_id.get()
+        if not sid:
+            return
+        s = (self.current_state or {}).get('all_ships', {}).get(sid)
+        if not s:
+            return
+        if kill:
+            new_alive = False
+            new_hits = int(s.get('max_hits', 1))
+            action = "✖ KILL"
+        else:
+            new_alive = bool(s.get('alive', True))
+            new_hits = max(0, int(s.get('hits', 0)) + hits_delta)
+            action = f"{'−' if hits_delta>0 else '+'}{abs(hits_delta)} HP"
+        ok = self.send_gm_command(
+            'override_ship', ship_id=sid,
+            x=int(s.get('x', 0)), y=int(s.get('y', 0)),
+            z=int(s.get('z', 0)), alive=new_alive, hits=new_hits)
+        if ok:
+            self._push_history(f"{sid}  {action}")
+
+    def _push_history(self, line):
+        ts = time.strftime("%H:%M:%S")
+        entry = f"[{ts}] {line}"
+        self.override_history.append(entry)
+        self.override_history = self.override_history[-100:]
+        T = self.history_text
+        T.configure(state=NORMAL)
+        T.delete("1.0", END)
+        for e in reversed(self.override_history[-20:]):
+            T.insert(END, e + "\n")
+        T.configure(state=DISABLED)
+
+    # ------------------------------------------------- legend (modal) -----
+
+    def open_legend(self):
+        pal, fnt = self.pal, self.fnt
+        if getattr(self, "_legend_win", None) and \
+                self._legend_win.winfo_exists():
+            self._legend_win.lift()
+            self._legend_win.focus_force()
+            return
+        win = Toplevel(self.root)
+        self._legend_win = win
+        win.title("Справка · Типы кораблей")
+        win.configure(bg=pal.bg_root)
+        win.transient(self.root)
+        win.geometry("760x620+120+60")
+
+        head = Frame(win, bg=pal.bg_root)
+        head.pack(fill=X, padx=20, pady=(16, 6))
+        Label(head, text="📖  Справочник по типам кораблей",
+              bg=pal.bg_root, fg=pal.fg_title, font=fnt.h1
+              ).pack(side=LEFT)
+        Button(head, text="✕", bg=pal.bg_card, fg=pal.fg_primary,
+               activebackground=pal.border_strong,
+               font=fnt.h3, bd=0, relief=FLAT, cursor="hand2", width=3,
+               command=win.destroy).pack(side=RIGHT)
+
+        canvas = Canvas(win, bg=pal.bg_root, highlightthickness=0)
+        canvas.pack(side=LEFT, fill=BOTH, expand=True, padx=(20, 0), pady=4)
+        sb = ttk.Scrollbar(win, orient=VERTICAL, command=canvas.yview)
+        sb.pack(side=RIGHT, fill=Y, padx=(0, 20), pady=4)
+        canvas.configure(yscrollcommand=sb.set)
+        inner = Frame(canvas, bg=pal.bg_root)
+        inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e, c=canvas, i=inner_id:
+                    c.itemconfigure(i, width=e.width))
+        for wheel_ev in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            canvas.bind_all(
+                wheel_ev,
+                lambda e, c=canvas: self._scroll(e, c), add="+")
+
+        order = ["Прыгун", "Артиллерия", "Бурав", "Факел", "Тишина",
+                 "Провокатор", "Паук", "Радиовышка", "Крейсер"]
+        for typ in order:
+            info = SHIP_TYPE_INFO.get(typ)
+            if not info:
+                continue
+            self._render_legend_card(inner, typ, info, pal, fnt)
+
+        footer = Frame(win, bg=pal.bg_root)
+        footer.pack(fill=X, padx=20, pady=(0, 14), side=BOTTOM)
+        Label(footer, text="Победа: уничтожить корабли всех других команд. "
+                           "При таймауте (30 ходов) побеждает команда с "
+                           "наибольшим нанесённым уроном.",
+              bg=pal.bg_root, fg=pal.fg_secondary, font=fnt.small,
+              wraplength=700, justify=LEFT).pack(anchor=W)
+        win.bind("<Escape>", lambda e: win.destroy())
+
+    def _render_legend_card(self, parent, typ, info, pal, fnt):
+        card = Frame(parent, bg=pal.bg_card, bd=0,
+                     highlightthickness=1, highlightbackground=pal.border)
+        card.pack(fill=X, padx=10, pady=6)
+        stripe = Canvas(card, width=6, height=1,
+                        bg=info.get("accent", pal.accent_info),
+                        highlightthickness=0)
+        stripe.pack(side=LEFT, fill=Y)
+        body = Frame(card, bg=pal.bg_card)
+        body.pack(side=LEFT, fill=BOTH, expand=True, padx=10, pady=8)
+
+        head = Frame(body, bg=pal.bg_card)
+        head.pack(fill=X)
+        Label(head, text=info.get("icon", "🛰"), bg=pal.bg_card,
+              fg=info.get("accent", pal.accent_info), font=fnt.h1
+              ).pack(side=LEFT, padx=(0, 10))
+        Label(head, text=typ, bg=pal.bg_card, fg=pal.fg_title,
+              font=fnt.h2).pack(side=LEFT)
+        Label(head, text="  · " + info.get("role", ""),
+              bg=pal.bg_card, fg=pal.fg_secondary, font=fnt.small
+              ).pack(side=LEFT)
+
+        stats = info.get("stats") or {}
+        if stats:
+            st = Frame(body, bg=pal.bg_card)
+            st.pack(fill=X, pady=(4, 2))
+            for k, v in stats.items():
+                pill = Frame(st, bg=pal.bg_panel, bd=0)
+                pill.pack(side=LEFT, padx=(0, 6))
+                Label(pill, text=f"{k}", bg=pal.bg_panel,
+                      fg=pal.fg_muted, font=fnt.small
+                      ).pack(side=LEFT, padx=(6, 2), pady=2)
+                Label(pill, text=f"{v}", bg=pal.bg_panel,
+                      fg=pal.fg_primary, font=fnt.small_bold
+                      ).pack(side=LEFT, padx=(0, 6), pady=2)
+        for line in info.get("abilities") or []:
+            Label(body, text=f"• {line}", bg=pal.bg_card,
+                  fg=pal.fg_primary, font=fnt.small, justify=LEFT,
+                  anchor=W).pack(anchor=W, pady=1)
+
+    # ----------------------------------------------- gm send + timers -----
+
     def send_gm_command(self, command, **payload):
-        """Отправить gm_command серверу. Тихо логирует ошибки в status_bar."""
         if not self.connected or self.framed is None:
             messagebox.showwarning("Нет соединения", "Не подключен к серверу")
             return False
@@ -647,180 +1179,7 @@ class GameMasterGUI:
             return False
         return True
 
-    def open_override_dialog(self):
-        """Диалог принудительного изменения позиции/состояния корабля (арбитраж)."""
-        if not self.current_state:
-            messagebox.showinfo("Нет данных", "Данные о кораблях ещё не получены")
-            return
-        all_ships = self.current_state.get('all_ships', {})
-        if not all_ships:
-            messagebox.showinfo("Нет кораблей", "На карте нет кораблей")
-            return
-
-        dlg = Toplevel(self.root)
-        dlg.title("🛠 Override корабля")
-        dlg.configure(bg=self.colors['bg'])
-        dlg.transient(self.root)
-        dlg.grab_set()
-        dlg.geometry("420x380")
-
-        Label(dlg, text="🛠 РУЧНОЕ ИЗМЕНЕНИЕ ПОЗИЦИИ",
-              bg=self.colors['bg'], fg=self.colors['accent4'],
-              font=('Arial', 13, 'bold')).pack(pady=10)
-
-        form = Frame(dlg, bg=self.colors['panel'], bd=2, relief=RAISED)
-        form.pack(padx=20, pady=10, fill=BOTH, expand=True)
-
-        # Корабль
-        Label(form, text="Корабль:", bg=self.colors['panel'], fg='white',
-              font=('Arial', 10, 'bold')).grid(row=0, column=0, sticky=W, padx=10, pady=6)
-        ship_options = []
-        for sid, s in sorted(all_ships.items()):
-            label = (f"{sid}  [{s.get('team','?')}]  {s.get('name','')}  "
-                     f"({s.get('x','?')},{s.get('y','?')},{s.get('z','?')})  "
-                     f"{'alive' if s.get('alive') else 'DEAD'} "
-                     f"hits={s.get('hits',0)}")
-            ship_options.append((sid, label, s))
-
-        id_var = StringVar(value=ship_options[0][1])
-        ship_menu = ttk.Combobox(form, textvariable=id_var,
-                                 values=[lbl for (_, lbl, _) in ship_options],
-                                 state='readonly', width=48)
-        ship_menu.grid(row=0, column=1, columnspan=3, sticky=EW, padx=10, pady=6)
-
-        # X / Y / Z
-        def _coord_row(label, r, default):
-            Label(form, text=label, bg=self.colors['panel'], fg='white',
-                  font=('Arial', 10, 'bold')).grid(row=r, column=0, sticky=W, padx=10, pady=6)
-            sv = IntVar(value=default)
-            Spinbox(form, from_=0, to=9, textvariable=sv, width=6,
-                    font=('Arial', 10)).grid(row=r, column=1, sticky=W, padx=10, pady=6)
-            return sv
-
-        first_ship = ship_options[0][2]
-        x_var = _coord_row("X (0–9):", 1, int(first_ship.get('x', 0)))
-        y_var = _coord_row("Y (0–9):", 2, int(first_ship.get('y', 0)))
-        z_var = _coord_row("Z (0–9):", 3, int(first_ship.get('z', 0)))
-
-        # alive / hits
-        alive_var = BooleanVar(value=bool(first_ship.get('alive', True)))
-        Checkbutton(form, text="Жив", variable=alive_var,
-                    bg=self.colors['panel'], fg='white',
-                    selectcolor=self.colors['bg2'],
-                    activebackground=self.colors['panel'],
-                    font=('Arial', 10, 'bold')
-                    ).grid(row=4, column=0, sticky=W, padx=10, pady=6)
-
-        Label(form, text="Попаданий:", bg=self.colors['panel'], fg='white',
-              font=('Arial', 10, 'bold')).grid(row=4, column=1, sticky=E, padx=5, pady=6)
-        hits_var = IntVar(value=int(first_ship.get('hits', 0)))
-        Spinbox(form, from_=0, to=10, textvariable=hits_var, width=6,
-                font=('Arial', 10)).grid(row=4, column=2, sticky=W, pady=6)
-
-        # Обновляем поля при смене корабля.
-        def _on_ship_selected(*_):
-            idx = ship_menu.current()
-            if idx < 0:
-                return
-            sid, _label, s = ship_options[idx]
-            x_var.set(int(s.get('x', 0)))
-            y_var.set(int(s.get('y', 0)))
-            z_var.set(int(s.get('z', 0)))
-            alive_var.set(bool(s.get('alive', True)))
-            hits_var.set(int(s.get('hits', 0)))
-        ship_menu.bind("<<ComboboxSelected>>", _on_ship_selected)
-
-        # Кнопки
-        btns = Frame(dlg, bg=self.colors['bg'])
-        btns.pack(pady=10)
-
-        def _apply():
-            idx = ship_menu.current()
-            if idx < 0:
-                return
-            sid = ship_options[idx][0]
-            ok = self.send_gm_command(
-                'override_ship',
-                ship_id=sid,
-                x=int(x_var.get()),
-                y=int(y_var.get()),
-                z=int(z_var.get()),
-                alive=bool(alive_var.get()),
-                hits=int(hits_var.get()),
-            )
-            if ok:
-                dlg.destroy()
-
-        Button(btns, text="✅ Применить", bg=self.colors['accent3'], fg='black',
-               font=('Arial', 10, 'bold'), width=15, command=_apply).pack(side=LEFT, padx=10)
-        Button(btns, text="Отмена", bg=self.colors['accent2'], fg='white',
-               font=('Arial', 10, 'bold'), width=10,
-               command=dlg.destroy).pack(side=LEFT, padx=10)
-    
-    def update_map(self, *args):
-        """Обновляет отображение карты для текущего слоя"""
-        if not self.current_state:
-            return
-        
-        layer = self.current_layer.get()
-        # Обновляем надпись слоя
-        self.layer_label.config(text=f"Z = {layer}")
-        
-        all_ships = self.current_state.get('all_ships', {})
-        
-        # Очищаем карту
-        for row in range(10):
-            for col in range(10):
-                self.cells[row][col].config(
-                    text=" ",
-                    bg=self.colors['bg2'],
-                    fg="white"
-                )
-        
-        # Отображаем все корабли на текущем слое
-        for ship_id, ship in all_ships.items():
-            if ship['z'] == layer:
-                x, y = ship['x'], ship['y']
-                
-                # Определяем цвет команды
-                if ship['team'] == 'Team A':
-                    bg_color = '#4169E1'  # Синий
-                elif ship['team'] == 'Team B':
-                    bg_color = '#DC143C'  # Красный
-                else:
-                    bg_color = '#228B22'  # Зелёный
-                
-                # Определяем символ для типа корабля
-                ship_type = ship.get('type', 'Базовый')
-                if ship_type == 'Крейсер':
-                    type_char = "К"
-                elif ship_type == 'Артиллерия':
-                    type_char = "А"
-                elif ship_type == 'Радиовышка':
-                    type_char = "Р"
-                else:
-                    type_char = "Б"
-                
-                # Если корабль уничтожен
-                if not ship['alive']:
-                    display_text = f"💀{type_char}"
-                    bg_color = '#4a4a4a'  # Серый
-                elif ship['hits'] > 0:
-                    display_text = f"{type_char}{ship['hits']}"
-                    bg_color = 'orange'
-                else:
-                    display_text = type_char
-                
-                self.cells[y][x].config(
-                    text=display_text,
-                    bg=bg_color,
-                    fg='white',
-                    font=('Arial', 10, 'bold')
-                )
-    
     def tick_timer(self):
-        """Каждую секунду пересчитывает таймер из current_state, даже если от
-        сервера нет нового пуша."""
         try:
             state = self.current_state
             if state is not None and state.get('phase') == 'planning':
@@ -830,17 +1189,16 @@ class GameMasterGUI:
                     received = state.get('actions_received_teams', [])
                     connected = state.get('connected_teams', [])
                     self.timer_label.config(
-                        text=f"⏱ {remaining}с  |  действия: "
-                             f"{len(received)}/{len(connected)}"
-                    )
+                        text=f"⏱ {remaining}с  ·  сборы "
+                             f"{len(received)}/{len(connected)}")
         finally:
             self.root.after(500, self.tick_timer)
 
+    # ------------------------------------------------------------ run -----
+
     def run(self):
-        """Запускает приложение"""
-        self.root.after(500, self.tick_timer)
         self.root.mainloop()
 
+
 if __name__ == "__main__":
-    app = GameMasterGUI()
-    app.run()
+    GameMasterGUI().run()
