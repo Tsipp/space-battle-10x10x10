@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+*.log
+# Логи симуляций партий игра между ботами — хранятся в репозитории как
+# артефакты тестовых прогонов.
+!game_logs/*.log
+.DS_Store
+.idea/
+.vscode/
