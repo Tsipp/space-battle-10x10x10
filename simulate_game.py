@@ -626,28 +626,46 @@ class TeamBot:
           • Все остальные: идут к ближайшему видимому врагу; если никого не
             видно — к самому «свежему» last_known_enemies или в центр карты.
         """
-        # --- Факел: приоритет — раненые союзники ---
+        # --- Факел (Баланс v7): держится в ЦЕНТРЕ союзной группы ---
+        # Цели:
+        #   • максимизировать число союзников в heal_range=2 (AoE-хил);
+        #   • не «героически» лезть вперёд к одинокому раненому на линии огня;
+        #   • сохранить возможность догнать раненого, если рядом с ним ещё
+        #     есть наши (т.е. группа в целом двигается, а не один изолирован).
         if getattr(ship, 'heal_range', 0) > 0:
-            wounded = [a for a in my_ships if a.alive and a.hits > 0 and a.id != ship.id]
-            if wounded:
-                # Наиболее раненый (по доле hp_lost/max_hits) в первую очередь.
-                wounded.sort(
-                    key=lambda a: (a.hits / max(1, a.max_hits), -max(
-                        abs(a.x - ship.x), abs(a.y - ship.y), abs(a.z - ship.z)
-                    )),
-                    reverse=True,
+            allies = [a for a in my_ships if a.alive and a.id != ship.id]
+            if allies:
+                wounded = [a for a in allies if a.hits > 0]
+                if wounded:
+                    # Приоритет наиболее раненого, но только если он НЕ один
+                    # (рядом с ним есть хотя бы ещё 1 союзник в radius 2).
+                    wounded.sort(
+                        key=lambda a: -(a.hits / max(1, a.max_hits)),
+                    )
+                    for cand in wounded:
+                        neighbors = [
+                            a for a in allies if a.id != cand.id
+                            and max(
+                                abs(a.x - cand.x),
+                                abs(a.y - cand.y),
+                                abs(a.z - cand.z),
+                            ) <= 2
+                        ]
+                        if neighbors:
+                            return cand.x, cand.y, cand.z
+                # Никого не лечить: центроид 3 ближайших союзников.
+                allies.sort(
+                    key=lambda a: max(
+                        abs(a.x - ship.x),
+                        abs(a.y - ship.y),
+                        abs(a.z - ship.z),
+                    )
                 )
-                return wounded[0].x, wounded[0].y, wounded[0].z
-            # Нет раненых: держимся рядом с самым «дорогим» союзником.
-            valuable_allies = [a for a in my_ships if a.alive and a.id != ship.id]
-            if valuable_allies:
-                # Приоритет — корабли с высокой атакой (Артиллерия, Прыгун).
-                valuable_allies.sort(
-                    key=lambda a: (getattr(a, 'damage', 0), a.max_hits),
-                    reverse=True,
-                )
-                anchor = valuable_allies[0]
-                return anchor.x, anchor.y, anchor.z
+                cluster = allies[:3]
+                cx = sum(a.x for a in cluster) // len(cluster)
+                cy = sum(a.y for a in cluster) // len(cluster)
+                cz = sum(a.z for a in cluster) // len(cluster)
+                return cx, cy, cz
 
         # --- Обычное поведение: ближайший видимый враг ---
         if visible_ships:
