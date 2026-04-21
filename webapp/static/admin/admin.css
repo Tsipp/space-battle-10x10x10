@@ -1,0 +1,21 @@
+.team-card {
+  display: grid;
+  grid-template-columns: 60px 1fr auto;
+  gap: 12px;
+  align-items: center;
+}
+.team-card h3 { margin: 0; }
+.team-card .letter {
+  font-size: 24px; font-weight: 800; width: 60px; text-align: center;
+  padding: 12px 0; border-radius: 10px;
+}
+.team-card.team-A-bg .letter { color: var(--team-a); }
+.team-card.team-B-bg .letter { color: var(--team-b); }
+.team-card.team-C-bg .letter { color: var(--team-c); }
+.roster-pill {
+  display: inline-flex; gap: 4px; align-items: center;
+  padding: 2px 8px; background: var(--bg-panel); border: 1px solid var(--border);
+  border-radius: 12px; font-size: 12px;
+}
+.log-line { padding: 4px 6px; border-bottom: 1px solid var(--border); font-family: 'DejaVu Sans Mono', monospace; }
+.log-line:last-child { border-bottom: none; }
